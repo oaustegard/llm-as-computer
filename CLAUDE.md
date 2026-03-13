@@ -26,6 +26,10 @@ remember(
 
 Lead with *why*, not *what* — the diff shows what. Include surprises, rejected approaches, and architectural implications.
 
+### Regular Memory Updates
+
+Store progress updates to Muninn **regularly during work**, not just at the end. Any time you complete a meaningful sub-task, hit a blocker, or discover something unexpected, call `remember()` so future sessions have context. Aim for at least one memory store per significant milestone (e.g., "tests passing", "new opcode working", "design decision made"). This protects against session cutoffs losing context.
+
 ## Project Context
 
 ### What This Is
@@ -56,6 +60,7 @@ The workhorse primitive: `k = (2j, -j²)` encodes position j such that dot-produ
 | 9 | phase9_weighted_arithmetic.py | Complete | Weighted loss perfects doubling (100%) but DIFF+ADD stays 0% |
 | 11 | phase11_compile_executor.py | Complete | Compiled execution: correct traces, extended ISA (SUB/JZ/JNZ), O(log t) path |
 | 12 | phase12_percepta_model.py | Complete | Full PyTorch compiled transformer with real nn.Linear weight matrices |
+| 13 | phase13_isa_completeness.py | Complete | ISA completeness: SWAP/OVER/ROT + Fibonacci, multiply, power-of-2, sum, parity |
 
 ### Phase 5 Key Finding
 
@@ -147,6 +152,23 @@ Phase 12 implements the Percepta model as a real PyTorch `nn.Module` with actual
 4. **Address verification** needed for stack reads — pure parabolic attention can select wrong-address entries; a second head reads the address and the FF gates the value. This is architecturally valid (two heads cooperating via FF).
 
 **Key insight:** The transition from Phase 11 (numpy simulation) to Phase 12 (PyTorch matmul) required solving **address verification** — parabolic scores are positive even for wrong addresses when the query address exceeds the stored address. The fix: an address-checking head reads `key[0]/2` and the FF layer gates the value (output 0 if address mismatch). This is what multiple heads in a real transformer would do.
+
+### Phase 13 Key Findings — ISA COMPLETENESS
+
+Phase 13 proves the compiled transformer is a general-purpose stack computer, not just a special-case executor.
+
+**New opcodes:** SWAP (exchange top two), OVER (copy second to top), ROT (rotate top 3: [a,b,c]→[b,c,a]). ROT required a new attention head (Head 4) reading SP-2, using one of 14 reserved head slots.
+
+**Algorithm suite (all correct on both numpy + PyTorch, trace-level match):**
+1. **Fibonacci(n):** Iterative with 3-value cycling via SWAP+OVER+ADD+ROT. fib(10)=55 in 111 steps from 19 instructions.
+2. **Multiply(a,b):** Repeated addition. mul(12,10)=120 in 119 steps.
+3. **Power of 2 (2^n):** Repeated doubling via DUP+ADD. 2^7=128 in 76 steps.
+4. **Sum(1..n):** Accumulation loop. sum(1..15)=120 in 156 steps.
+5. **Parity (is_even):** Conditional branching via repeated subtraction-by-2.
+
+**Architecture:** d_model=36, 5 active heads (of 18 slots), 12 opcodes, 964 compiled parameters.
+
+**Key insight:** Adding SWAP/OVER/ROT transforms the ISA from "theoretically Turing-complete but practically limited" to "Forth-equivalent and practically programmable." The attention head for SP-2 was architecturally trivial (same Q bias pattern as SP-1), confirming the parabolic addressing scheme generalizes cleanly to arbitrary stack depths.
 
 ## Development Notes
 
