@@ -53,6 +53,7 @@ The workhorse primitive: `k = (2j, -j²)` encodes position j such that dot-produ
 | 6 | phase6_curriculum.py | Complete | Curriculum learning: 56%→85% acc, 0→39/50 perfect traces |
 | 7 | phase7_percepta_arch.py | Complete | Percepta architecture (d=36,h=18,L=7): 84.6% acc, DIFF+ADD still 0% |
 | 8 | phase8_microop_traces.py | Complete | Micro-op decomposition proves retrieval is solved; arithmetic is bottleneck |
+| 9 | phase9_weighted_arithmetic.py | Complete | Weighted loss perfects doubling (100%) but DIFF+ADD stays 0% |
 
 ### Phase 5 Key Finding
 
@@ -87,6 +88,24 @@ Micro-op trace format expands each step from 4 to 6 tokens: `[OP, ARG, FETCH1, F
 5. **ADD-enriched data marginally helps** — 50% DIFF+ADD training data yields 1/30 (3%), barely breaking the wall.
 
 **Revised architectural insight:** "Attention is lookup; feed-forward is arithmetic." Attention reliably learns content-addressable retrieval via gradient descent. But FF layers struggle to learn even simple arithmetic (integer addition) when it's a minority of the training signal. This suggests real transformer execution requires either (a) arithmetic pre-training, (b) massive over-sampling of arithmetic examples, or (c) external arithmetic modules.
+
+### Phase 9 Key Findings — WEIGHTED LOSS
+
+Upweighting arithmetic tokens in the loss (10x-50x on ADD's TOP position) tests whether gradient signal alone explains the DIFF+ADD wall.
+
+**Results:**
+- **DUP+ADD: 83% → 100%.** Weighted loss perfects doubling (f(a)=2a). This was learnable but under-trained.
+- **SAME+ADD: 83% → 100%.** Same story — doubling perfected.
+- **DIFF+ADD: 0% → 0%.** True addition (f(a,b)=a+b for a≠b) not learned at ANY weight (10x, 20x, 50x).
+- Higher weights (50x) actually hurt overall accuracy (87.4% vs 88.3% at 10x) by destabilizing non-ADD tokens.
+
+**Conclusion:** The DIFF+ADD wall is NOT a gradient signal problem. It's a representational problem: the FF layers cannot learn integer addition in token embedding space while simultaneously handling execution logic. The model can learn addition in isolation (98% in Phase 8's bare test) but not within the multi-task execution context.
+
+**The bottleneck progression is now fully characterized:**
+1. Copy mechanism — solved by more data (Phase 6)
+2. Stack retrieval — solved by micro-op decomposition (Phase 8)
+3. Doubling (2a) — solved by weighted loss (Phase 9)
+4. True addition (a+b, a≠b) — **unsolved**: requires either joint arithmetic training, digit-level decomposition, or dedicated arithmetic modules
 
 ## Development Notes
 
