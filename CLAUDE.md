@@ -55,6 +55,7 @@ The workhorse primitive: `k = (2j, -j²)` encodes position j such that dot-produ
 | 8 | phase8_microop_traces.py | Complete | Micro-op decomposition proves retrieval is solved; arithmetic is bottleneck |
 | 9 | phase9_weighted_arithmetic.py | Complete | Weighted loss perfects doubling (100%) but DIFF+ADD stays 0% |
 | 11 | phase11_compile_executor.py | Complete | Compiled execution: correct traces, extended ISA (SUB/JZ/JNZ), O(log t) path |
+| 12 | phase12_percepta_model.py | Complete | Full PyTorch compiled transformer with real nn.Linear weight matrices |
 
 ### Phase 5 Key Finding
 
@@ -126,6 +127,26 @@ After rereading Percepta's blog post, we identified that Phases 5-10 diverged fr
 3. Doubling (2a) — solved by weighted loss (Phase 9)
 4. True addition (a+b, a≠b) — solved by **compilation** (Phase 11); unsolvable via training alone
 5. Control flow (branching, loops) — solved by compiled JZ/JNZ (Phase 11)
+
+### Phase 12 Key Findings — REAL PYTORCH COMPILED TRANSFORMER
+
+Phase 12 implements the Percepta model as a real PyTorch `nn.Module` with actual `nn.Linear` weight matrices set analytically. Programs execute via real tensor operations (`matmul`, `argmax`), not simulated numpy primitives.
+
+**Architecture:**
+- `d_model=36`, `head_dim=2` (2D parabolic key space, matching Percepta)
+- 4 active attention heads: program opcode fetch, program arg fetch, stack read at SP, stack read at SP-1
+- Hard-max attention (argmax, not softmax)
+- FF dispatch: bilinear gating (opcode one-hot × value routing matrix)
+- 758 total compiled parameters (722 in attention heads + 36 in dispatch buffers)
+- Float64 precision for parabolic addressing correctness
+
+**Results:**
+1. **100% trace match** on all Phase 4 test programs (10/10).
+2. **Extended ISA works** — SUB, JZ/JNZ, NOP all correct (8/8), including countdown loop.
+3. **Full-sequence attention** confirmed — the compiled weights work in standard transformer Q@K^T → argmax → V framework.
+4. **Address verification** needed for stack reads — pure parabolic attention can select wrong-address entries; a second head reads the address and the FF gates the value. This is architecturally valid (two heads cooperating via FF).
+
+**Key insight:** The transition from Phase 11 (numpy simulation) to Phase 12 (PyTorch matmul) required solving **address verification** — parabolic scores are positive even for wrong addresses when the query address exceeds the stored address. The fix: an address-checking head reads `key[0]/2` and the FF layer gates the value (output 0 if address mismatch). This is what multiple heads in a real transformer would do.
 
 ## Development Notes
 
