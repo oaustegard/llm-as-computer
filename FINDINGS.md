@@ -1,6 +1,6 @@
 # Percepta "Can LLMs Be Computers?" — R&D Findings
 
-**Writeup:** [Can LLMs Be Computers? — An Independent Validation](https://whtwnd.com/austegard.com/3mgxahx5axp2c)
+**Writeup:** [WRITEUP.md](WRITEUP.md)
 
 ## Context
 Testing core primitives from Percepta's blog post (Mar 11, 2026) about embedding

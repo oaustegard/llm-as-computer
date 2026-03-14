@@ -2,7 +2,7 @@
 
 **Context:** The Percepta blog post "Can LLMs Be Computers?" claims that restricting transformer attention heads to 2D enables O(log t) decoding via convex hull queries, making million-step execution traces feasible inside a transformer. No code or weights are published. This plan tests the core claims from first principles.
 
-**Writeup:** [Can LLMs Be Computers? — An Independent Validation](https://whtwnd.com/austegard.com/3mgxahx5axp2c)
+**Writeup:** [WRITEUP.md](WRITEUP.md)
 
 **Environment:** Claude skills container — CPU-only, Python 3.12, PyTorch available, scipy available. No GPU. This is fine; the whole point of their approach is CPU-friendly execution.
 

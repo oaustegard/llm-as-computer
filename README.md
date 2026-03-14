@@ -2,7 +2,7 @@
 
 Testing [Percepta's claim](https://percepta.ai/blog/can-llms-be-computers) that transformers can execute programs internally via 2D convex hull attention, achieving O(log t) per-step decoding over million-step execution traces.
 
-**Writeup:** [Can LLMs Be Computers? — An Independent Validation](https://whtwnd.com/austegard.com/3mgxahx5axp2c)
+**Writeup:** [WRITEUP.md](WRITEUP.md)
 
 ## What is this?
 
