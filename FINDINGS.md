@@ -570,7 +570,7 @@ Adding SWAP/OVER/ROT transforms the ISA from "theoretically Turing-complete but 
 
 1. **Attention is lookup; feed-forward is routing/arithmetic.** The 2D parabolic attention primitives are elegant, compose cleanly, and are reliably learnable. The hard part is the conditional logic in FF layers — and for arithmetic, it must be compiled, not trained.
 
-2. **The training detour (Phases 5–9) was essential.** It precisely characterized what gradient descent can and cannot learn about execution. Retrieval: learnable. Routing: learnable. Doubling: learnable with help. True addition: not learnable in multi-task context. This is a fundamental finding about transformer capabilities.
+2. **The training detour (Phases 5–9) was accidental but informative.** It was not a planned departure from Percepta's compile approach — it was drift across sessions caused by not anchoring to their specific claims. But it did characterize what gradient descent can and cannot learn about execution. Retrieval: learnable. Routing: learnable. Doubling: learnable with help. True addition: not learnable in multi-task context.
 
 3. **Compile, don't train.** Percepta's core insight is correct. When arithmetic and routing logic are compiled directly into weight matrices, the transformer executes correctly — including operations that training alone provably cannot learn.
 

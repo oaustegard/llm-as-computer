@@ -29,7 +29,7 @@ They released no code or weights. This repo independently tests whether the core
 
 ### Detour: Can Gradient Descent Learn Execution? (Phases 5–9)
 
-Phases 5–9 explored whether a small transformer could *learn* to execute programs from training data alone. This was a deliberate departure from Percepta's compile approach. The journey was instructive — it precisely characterized *why* compilation is necessary.
+Phases 5–9 explored whether a small transformer could *learn* to execute programs from training data alone. This was not a deliberate departure from Percepta's compile approach — it was accidental drift across sessions. Without an extractive summary of Percepta's specific claims pinned to our plan, "let's try training" felt like a natural next step even though the blog post's entire thesis is that compilation, not training, is the answer. The journey was nonetheless instructive — it precisely characterized *why* compilation is necessary.
 
 | Phase | Description | Status | Key Finding |
 |-------|------------|--------|-------------|

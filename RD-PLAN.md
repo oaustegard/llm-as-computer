@@ -54,7 +54,7 @@
 
 ## Phases 5–9: The Training Detour ✅
 
-Phases 5–9 explored whether gradient descent could learn execution from data — a deliberate departure from Percepta's compile approach. While this path didn't achieve perfect execution, it produced essential findings about what transformers can and cannot learn.
+Phases 5–9 explored whether gradient descent could learn execution from data. This was not a deliberate departure from Percepta's compile approach — it was accidental drift across sessions, caused by not anchoring our plan to an extractive summary of Percepta's specific claims. While this path didn't achieve perfect execution, it produced useful findings about what transformers can and cannot learn.
 
 ### Phase 5: Trained Micro-Executor ✅
 
