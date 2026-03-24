@@ -32,6 +32,20 @@ Store progress updates to Muninn **regularly during work**, not just at the end.
 
 ## Project Context
 
+### Codebase Structure
+
+The repo has two layers: **consolidated modules** (current API) and **phase files** (research history).
+
+**Import from these for new work:**
+- `isa.py` — Types (`Instruction`, `Trace`, `TraceStep`), all 42 opcodes, embedding dims, `CompiledAttentionHead`, embedding/test utilities
+- `executor.py` — `NumPyExecutor`, `CompiledModel`, `TorchExecutor` (flattened, no inheritance chains)
+- `programs.py` — All program generators (`make_fibonacci`, `make_factorial`, `make_gcd`, etc.)
+- `test_consolidated.py` — Cross-validates consolidated vs phase14 executors
+
+**Do NOT import from phase files for new work.** They exist as research history documenting the progression from Phase 1 (hull cache) through Phase 14 (42-opcode ISA). The consolidated modules contain the same functionality, flattened.
+
+See `_MAP.md` for the full code map with every class, function, and method signature.
+
 ### What This Is
 
 A bottom-up validation of whether transformer attention + FF layers can implement program execution. Each phase isolates a primitive, tests it numerically, then composes with prior phases.
