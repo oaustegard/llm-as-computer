@@ -172,25 +172,38 @@ Phase 13 proves the compiled transformer is a general-purpose stack computer, no
 
 ## Development Notes
 
+### Code Map
+
+**`_MAP.md` is the navigation index.** It contains every class, function, method, and constant across all Python files with signatures and line numbers. Read it FIRST when starting work — it tells you what exists and where, without reading 7000 lines of source.
+
+**Workflow:**
+1. Read `_MAP.md` (489 lines) — understand the full codebase structure
+2. Identify which file(s) you need based on the map
+3. Read those files IN FULL — you have a 1M context window, use it
+4. Then act
+
+The map shows the inheritance chain, so you can see that `Phase14Executor` extends `Phase13Executor` extends `ExtendedExecutor` without reading three files to discover this.
+
+**Regenerate the map** after adding new files:
+```bash
+python3 scripts/generate_map.py  # or use ast-based generator
+```
+
 ### File Reading Discipline
 
-**Read aggressively, in bulk.** Do not do read-think-read-think loops over the same file. When you need to understand a file:
+**CRITICAL: You have a 1M context window. USE IT.** Read entire files in one shot — NEVER use `offset`/`limit` parameters to read files incrementally. Incremental reading wastes tool calls, causes timeouts, and you end up reading the whole file anyway.
 
-1. Read the ENTIRE file in one shot (or in 2-3 large chunks for files >500 lines)
-2. THEN think about what you've read
-3. THEN act
-
-**Anti-pattern** (wastes 4 tool calls and 3 thinking rounds):
+**Anti-pattern** (wastes tool calls, causes timeouts):
 ```
-Read phase13 lines 1-150 → think → Read phase13 lines 150-250 → think → Read phase13 lines 250-350 → think → "Now I have the full picture"
+Read phase14 lines 1-200 → think → Read lines 200-400 → think → Read lines 400-600 → think → ...
 ```
 
 **Correct** (1 tool call):
 ```
-Read phase13 (entire file) → "Now I have the full picture"
+Read _MAP.md → Read phase14 (entire 2900-line file) → "Now I have the full picture" → act
 ```
 
-When multiple files need reading, batch them into a single tool call where possible. The goal is to front-load context acquisition and minimize round-trips between reading and doing.
+Even for the largest file (phase14, 2900 lines ≈ 110KB), reading it whole fits trivially in context. The cost of one large read is far less than 6 small reads with thinking rounds between them.
 
 ### Environment Setup
 
