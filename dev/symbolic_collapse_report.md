@@ -35,15 +35,21 @@ about a specific input, **not** a symbolic proof over all n.
 
 ## Collapsed (guarded — finite conditionals)
 
-Each case is `guards ⇒ value_poly`. The `eml size` column sums
-across cases (total EML nodes to realise every branch); the
-`eml depth` column reports the deepest single case.
+Each case is `guards ⇒ value_poly`. Guarded dispatch has two
+EML costs: the **value** trees (one per case's `value_poly`)
+and the **guard** trees (one per `Guard` in every case's
+conjunction). Both are reported separately rather than rolled
+together — so the "what does one execution cost?" number and
+the "what does it take to realise the whole case table?"
+number stay distinguishable. _value Σ size_ / _value max depth_
+sum and max across cases' value trees; _guard Σ size_ / _guard
+max depth_ do the same across every guard tree.
 
-| Program | k heads | # cases | cases | eml size | eml depth | match |
-|---|---:|---:|---|---:|---:|:-:|
-| `select_by_sign(7)` | 5 | 2 | `{x0 != 0} → x4`<br>`{x0 == 0} → x7` | 2 | 0 | ✓ |
-| `clamp_zero(5)` | 5 | 2 | `{x0 != 0} → x0`<br>`{x0 == 0} → x5` | 2 | 0 | ✓ |
-| `either_or(3,7,1)` | 6 | 2 | `{x2 != 0} → x1`<br>`{x2 == 0} → x0` | 2 | 0 | ✓ |
+| Program | k heads | # cases | cases | value Σ size | value max depth | guard Σ size | guard max depth | match |
+|---|---:|---:|---|---:|---:|---:|---:|:-:|
+| `select_by_sign(7)` | 5 | 2 | `{x0 != 0} → x4`<br>`{x0 == 0} → x7` | 2 | 0 | 2 | 0 | ✓ |
+| `clamp_zero(5)` | 5 | 2 | `{x0 != 0} → x0`<br>`{x0 == 0} → x5` | 2 | 0 | 2 | 0 | ✓ |
+| `either_or(3,7,1)` | 6 | 2 | `{x2 != 0} → x1`<br>`{x2 == 0} → x0` | 2 | 0 | 2 | 0 | ✓ |
 
 ## Collapsed (unrolled at the catalog's concrete inputs)
 

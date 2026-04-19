@@ -27,6 +27,7 @@ from symbolic_executor import GuardedPoly, Poly
 from symbolic_programs_catalog import (
     _EML_AVAILABLE,
     CatalogEntry,
+    GuardedCaseEML,
     STATUS_BLOCKED_LOOP_SYM,
     STATUS_BLOCKED_OPCODE,
     STATUS_COLLAPSED,
@@ -224,6 +225,99 @@ def test_guarded_row_case_exprs_are_populated():
     assert r.case_exprs is not None and len(r.case_exprs) == 2
     # Each case_expr renders as "{guards} → value_poly".
     assert all("→" in ce for ce in r.case_exprs)
+
+
+# ─── S2: sharper EML accounting for guarded programs ─────────────
+
+def test_guarded_row_case_eml_populated_when_available():
+    """Each guarded case exposes its own EML size/depth for both the
+    value poly and each guard poly (issue #68 S2)."""
+    if not _EML_AVAILABLE:
+        print("  (eml-sr not available — skipping guarded case_eml test)")
+        return
+    rows = {r.name: r for r in run_catalog()}
+    for name in ("clamp_zero(5)", "select_by_sign(7)", "either_or(3,7,1)"):
+        r = rows[name]
+        assert r.case_eml is not None, name
+        assert len(r.case_eml) == r.n_cases, name
+        for c in r.case_eml:
+            assert isinstance(c, GuardedCaseEML), name
+            assert c.value_size >= 1, name
+            assert c.value_depth >= 0, name
+            # Every case in these demos has exactly one guard (single JZ
+            # fork on a single symbolic input).
+            assert len(c.guard_sizes) == 1 == len(c.guard_depths), name
+            assert c.guard_sizes[0] >= 1, name
+            assert c.guard_depths[0] >= 0, name
+
+
+def test_guarded_row_guard_trees_accounted():
+    """``eml_guard_size`` / ``eml_guard_depth`` are populated and
+    reconcile with the per-case breakdown (issue #68 S2)."""
+    if not _EML_AVAILABLE:
+        print("  (eml-sr not available — skipping guard accounting test)")
+        return
+    rows = {r.name: r for r in run_catalog()}
+    for name in ("clamp_zero(5)", "select_by_sign(7)", "either_or(3,7,1)"):
+        r = rows[name]
+        assert r.eml_guard_size is not None, name
+        assert r.eml_guard_depth is not None, name
+        # Reconcile aggregates against the per-case breakdown.
+        expected_size = sum(sum(c.guard_sizes) for c in (r.case_eml or []))
+        expected_depth = max(
+            (d for c in (r.case_eml or []) for d in c.guard_depths),
+            default=0,
+        )
+        assert r.eml_guard_size == expected_size, name
+        assert r.eml_guard_depth == expected_depth, name
+
+
+def test_guarded_row_value_aggregates_reconcile():
+    """``eml_size`` / ``eml_depth`` (value-tree aggregates) match the
+    sum / max of ``case_eml`` entries (issue #68 S2 — S1 semantics preserved)."""
+    if not _EML_AVAILABLE:
+        print("  (eml-sr not available — skipping value reconcile test)")
+        return
+    rows = {r.name: r for r in run_catalog()}
+    for name in ("clamp_zero(5)", "select_by_sign(7)", "either_or(3,7,1)"):
+        r = rows[name]
+        expected_size = sum(c.value_size for c in (r.case_eml or []))
+        expected_depth = max(
+            (c.value_depth for c in (r.case_eml or [])),
+            default=0,
+        )
+        assert r.eml_size == expected_size, name
+        assert r.eml_depth == expected_depth, name
+
+
+def test_guarded_row_guard_trees_match_trivial_polys():
+    """All three demo guards are single-variable polys (``x0`` or
+    ``x2``), which compile to 1-node, depth-0 EML trees — so each
+    case contributes exactly 1 to the guard-size total."""
+    if not _EML_AVAILABLE:
+        print("  (eml-sr not available — skipping trivial-guard shape test)")
+        return
+    rows = {r.name: r for r in run_catalog()}
+    # 2 cases × 1 guard × size-1 tree = 2; depth 0.
+    for name in ("clamp_zero(5)", "select_by_sign(7)", "either_or(3,7,1)"):
+        r = rows[name]
+        assert r.eml_guard_size == 2, (name, r.eml_guard_size)
+        assert r.eml_guard_depth == 0, (name, r.eml_guard_depth)
+
+
+def test_guarded_row_fields_absent_without_eml():
+    """When eml-sr is unavailable the S2 fields remain None — the row
+    still populates poly/guards text fields but not tree accounting."""
+    if _EML_AVAILABLE:
+        print("  (eml-sr available — skipping no-eml fallback test)")
+        return
+    rows = {r.name: r for r in run_catalog()}
+    r = rows["clamp_zero(5)"]
+    assert r.eml_guard_size is None
+    assert r.eml_guard_depth is None
+    assert r.case_eml is None
+    # But the textual columns still come through.
+    assert r.case_exprs is not None
 
 
 def test_run_catalog_single_entry_override():
