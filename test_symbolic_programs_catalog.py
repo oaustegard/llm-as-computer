@@ -23,10 +23,15 @@ import sys
 import isa
 from executor import NumPyExecutor
 from isa import program
-from symbolic_executor import Poly
+from symbolic_executor import GuardedPoly, Poly
 from symbolic_programs_catalog import (
     _EML_AVAILABLE,
     CatalogEntry,
+    STATUS_BLOCKED_LOOP_SYM,
+    STATUS_BLOCKED_OPCODE,
+    STATUS_COLLAPSED,
+    STATUS_COLLAPSED_GUARDED,
+    STATUS_COLLAPSED_UNROLLED,
     classify_program,
     poly_to_expr,
     run_catalog,
@@ -85,17 +90,27 @@ def test_classify_collapsed_branchless():
     assert cr.poly == Poly({((0, 1),): 16})
 
 
-def test_classify_blocks_control_flow():
-    # PUSH 3, DUP, JZ 99, HALT — first JZ wins
-    prog = [
-        isa.Instruction(isa.OP_PUSH, 3),
-        isa.Instruction(isa.OP_DUP),
-        isa.Instruction(isa.OP_JZ, 99),
-        isa.Instruction(isa.OP_HALT),
-    ]
+def test_classify_guarded_on_symbolic_branch():
+    """JZ on a symbolic input forks into a GuardedPoly (issue #70).
+
+    Before issue #70 this program was reported as ``blocked_control``;
+    the forking executor now handles JZ/JNZ when the condition is a
+    polynomial in the symbolic inputs.
+
+    Program: ``PUSH a; DUP; JZ 4; HALT; POP; PUSH 0; HALT`` — clamp-to-zero.
+    """
+    prog = program(
+        ("PUSH", 7), ("DUP",), ("JZ", 4), ("HALT",),
+        ("POP",), ("PUSH", 0), ("HALT",),
+    )
     cr = classify_program(prog)
-    assert cr.status == "blocked_control"
-    assert cr.blocker == "JZ"
+    assert cr.status == STATUS_COLLAPSED_GUARDED
+    assert cr.guarded is not None
+    assert cr.n_cases == 2
+    # The two cases split on whether x0 is zero.
+    guard_polys = [gs[0].poly for gs, _ in cr.guarded.cases]
+    assert all(gp == Poly.variable(0) for gp in guard_polys)
+    assert {g.eq_zero for gs, _ in cr.guarded.cases for g in gs} == {True, False}
 
 
 def test_classify_blocks_nonpolynomial_opcode():
@@ -160,6 +175,55 @@ def test_run_catalog_pins_poc_collapse_counts():
     assert rows["add_dup_add"].n_heads == 5
     assert rows["add_dup_add"].n_monomials == 2
     assert rows["add_dup_add"].poly_expr == "2*x0 + 2*x1"
+
+
+def test_run_catalog_pins_guarded_rows():
+    """Issue #70 pins: the three finite-conditional demos collapse to
+    two-case GuardedPolys and cross-check numerically."""
+    rows = {r.name: r for r in run_catalog()}
+
+    assert rows["clamp_zero(5)"].status == STATUS_COLLAPSED_GUARDED
+    assert rows["clamp_zero(5)"].n_cases == 2
+    assert rows["clamp_zero(5)"].numpy_top == 5
+    assert rows["clamp_zero(5)"].numeric_match is True
+
+    assert rows["select_by_sign(7)"].status == STATUS_COLLAPSED_GUARDED
+    assert rows["select_by_sign(7)"].n_cases == 2
+    assert rows["select_by_sign(7)"].numpy_top == 2
+    assert rows["select_by_sign(7)"].numeric_match is True
+
+    assert rows["either_or(3,7,1)"].status == STATUS_COLLAPSED_GUARDED
+    assert rows["either_or(3,7,1)"].n_cases == 2
+    assert rows["either_or(3,7,1)"].numpy_top == 7
+    assert rows["either_or(3,7,1)"].numeric_match is True
+
+
+def test_run_catalog_pins_unrolled_rows():
+    """Issue #70 pins: bounded loops unroll at concrete inputs and the
+    result is a constant Poly equal to the numpy top."""
+    rows = {r.name: r for r in run_catalog()}
+
+    # fib(5) = 5, factorial(4) = 24, is_even(6) = 1, power_of_2(4) = 16.
+    for name, expected in [
+        ("fibonacci(5)", 5),
+        ("factorial(4)", 24),
+        ("is_even(6)", 1),
+        ("power_of_2(4)", 16),
+    ]:
+        r = rows[name]
+        assert r.status == STATUS_COLLAPSED_UNROLLED, (name, r.status)
+        assert r.poly_expr == str(expected), (name, r.poly_expr)
+        assert r.numpy_top == expected
+        assert r.numeric_match is True
+
+
+def test_guarded_row_case_exprs_are_populated():
+    """Guarded rows expose per-case expressions, not just a lumped poly."""
+    rows = {r.name: r for r in run_catalog()}
+    r = rows["clamp_zero(5)"]
+    assert r.case_exprs is not None and len(r.case_exprs) == 2
+    # Each case_expr renders as "{guards} → value_poly".
+    assert all("→" in ce for ce in r.case_exprs)
 
 
 def test_run_catalog_single_entry_override():

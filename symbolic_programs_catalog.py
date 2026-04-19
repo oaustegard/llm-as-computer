@@ -36,8 +36,13 @@ import isa
 from executor import NumPyExecutor
 from isa import program
 from symbolic_executor import (
+    ForkingResult,
+    Guard,
+    GuardedPoly,
     Poly,
+    SymbolicOpNotSupported,
     SymbolicStackUnderflow,
+    run_forking,
     run_symbolic,
 )
 
@@ -97,50 +102,123 @@ _POLY_OPS = {
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
 }
-# Control flow — symbolic-executor scope excludes these even though the
-# taken path would technically evaluate. Reported separately so the
-# blocked rows split cleanly into "needs piecewise polys" (control flow)
-# vs "out of the polynomial ring" (comparisons, bitwise, division).
+# Control flow — handled by the forking executor (issue #70).
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
+# The forking executor accepts this full set.
+_FORKING_OPS = _POLY_OPS | _BRANCH_OPS
+
+
+# Status codes emitted by classify_program.
+STATUS_COLLAPSED          = "collapsed"
+STATUS_COLLAPSED_GUARDED  = "collapsed_guarded"
+STATUS_COLLAPSED_UNROLLED = "collapsed_unrolled"
+STATUS_BLOCKED_OPCODE     = "blocked_opcode"
+STATUS_BLOCKED_UNDERFLOW  = "blocked_underflow"
+STATUS_BLOCKED_LOOP_SYM   = "blocked_loop_symbolic"
+STATUS_BLOCKED_PATH_EXP   = "blocked_path_explosion"
 
 
 @dataclass
 class ClassificationResult:
-    status: str                         # "collapsed" | "blocked_opcode"
-                                        # | "blocked_control" | "blocked_underflow"
+    status: str
     blocker: Optional[str] = None
-    poly: Optional[Poly] = None
+    poly: Optional[Poly] = None           # present when status == collapsed*
+    guarded: Optional[GuardedPoly] = None # present when status == collapsed_guarded
     n_heads: int = 0
     bindings: Dict[int, int] = field(default_factory=dict)
+    n_cases: int = 0                       # number of cases in guarded output
+
+
+def _poly_or_guarded(result: ForkingResult):
+    """Pull the top out of a ForkingResult, already Poly | GuardedPoly | None."""
+    return result.top
 
 
 def classify_program(prog) -> ClassificationResult:
-    """Pre-flight check + symbolic execute. First blocker wins.
+    """Pre-flight check + forking symbolic execute. First blocker wins.
 
-    Walks the instruction list once before invoking :func:`run_symbolic` so
-    the blocked case reports the distinct ``blocked_control`` label — the
-    executor itself only knows "not polynomial-closed".
+    Order of checks:
+      1. ``blocked_opcode`` — any op outside ``_FORKING_OPS``.
+      2. Run :func:`run_forking` in symbolic mode:
+         - straight → ``collapsed`` (same semantics as the old executor).
+         - guarded → ``collapsed_guarded`` with a GuardedPoly top.
+         - unrolled (bounded loop with concrete counter) → ``collapsed_unrolled``.
+         - loop_symbolic → retry in concrete mode; if that completes with
+           straight/unrolled, return ``collapsed_unrolled``; else
+           ``blocked_loop_symbolic``.
+         - path_explosion → ``blocked_path_explosion``.
+         - blocked_underflow → ``blocked_underflow``.
     """
     for instr in prog:
         op = instr.op
-        if op in _BRANCH_OPS:
+        if op not in _FORKING_OPS:
             return ClassificationResult(
-                status="blocked_control",
+                status=STATUS_BLOCKED_OPCODE,
                 blocker=isa.OP_NAMES.get(op, f"?{op}"),
             )
-        if op not in _POLY_OPS:
-            return ClassificationResult(
-                status="blocked_opcode",
-                blocker=isa.OP_NAMES.get(op, f"?{op}"),
-            )
+
     try:
-        r = run_symbolic(prog)
+        r_sym = run_forking(prog, input_mode="symbolic")
+    except SymbolicOpNotSupported as e:
+        return ClassificationResult(status=STATUS_BLOCKED_OPCODE, blocker=str(e))
     except SymbolicStackUnderflow as e:
-        return ClassificationResult(status="blocked_underflow", blocker=str(e))
-    return ClassificationResult(
-        status="collapsed", poly=r.top,
-        n_heads=r.n_heads, bindings=r.bindings,
-    )
+        return ClassificationResult(status=STATUS_BLOCKED_UNDERFLOW, blocker=str(e))
+
+    if r_sym.status == "path_explosion":
+        return ClassificationResult(status=STATUS_BLOCKED_PATH_EXP)
+    if r_sym.status == "blocked_underflow":
+        return ClassificationResult(status=STATUS_BLOCKED_UNDERFLOW)
+
+    if r_sym.status == "straight":
+        top = r_sym.top if isinstance(r_sym.top, Poly) else None
+        return ClassificationResult(
+            status=STATUS_COLLAPSED, poly=top,
+            n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+        )
+    if r_sym.status == "guarded":
+        if isinstance(r_sym.top, GuardedPoly):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_GUARDED, guarded=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+                n_cases=r_sym.top.n_cases(),
+            )
+        # Single-case degenerate → treat as collapsed.
+        return ClassificationResult(
+            status=STATUS_COLLAPSED, poly=r_sym.top,
+            n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+        )
+    if r_sym.status == "unrolled":
+        # Pure symbolic-mode bounded-loop unroll (rare: requires the
+        # counter to become concrete via the polynomial arithmetic).
+        top = r_sym.top if isinstance(r_sym.top, Poly) else None
+        if top is not None:
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_UNROLLED, poly=top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
+
+    # loop_symbolic or mixed: retry in concrete mode. Concrete mode
+    # specialises every PUSH to its literal value, so loops whose
+    # counter is a concrete arg unroll deterministically.
+    try:
+        r_conc = run_forking(prog, input_mode="concrete")
+    except (SymbolicOpNotSupported, SymbolicStackUnderflow):
+        return ClassificationResult(status=STATUS_BLOCKED_LOOP_SYM)
+
+    if r_conc.status in ("straight", "unrolled") and isinstance(r_conc.top, Poly):
+        return ClassificationResult(
+            status=STATUS_COLLAPSED_UNROLLED, poly=r_conc.top,
+            n_heads=r_conc.n_heads, bindings={},
+        )
+    if r_conc.status == "guarded" and isinstance(r_conc.top, GuardedPoly):
+        return ClassificationResult(
+            status=STATUS_COLLAPSED_UNROLLED, guarded=r_conc.top,
+            n_heads=r_conc.n_heads, bindings={},
+            n_cases=r_conc.top.n_cases(),
+        )
+    if r_conc.status == "path_explosion":
+        return ClassificationResult(status=STATUS_BLOCKED_PATH_EXP)
+    return ClassificationResult(status=STATUS_BLOCKED_LOOP_SYM)
 
 
 # ─── Catalog ──────────────────────────────────────────────────────
@@ -218,11 +296,18 @@ def _default_catalog() -> List[CatalogEntry]:
         *P.make_bitwise_binary(isa.OP_AND, 12, 10),
     ))
 
-    # Blocked — control flow
+    # Bounded loops — unroll cleanly at concrete inputs (issue #70).
     entries.append(CatalogEntry("fibonacci(5)",  *P.make_fibonacci(5)))
     entries.append(CatalogEntry("factorial(4)",  *P.make_factorial(4)))
     entries.append(CatalogEntry("is_even(6)",    *P.make_is_even(6)))
     entries.append(CatalogEntry("power_of_2(4)", *P.make_power_of_2(4)))
+
+    # Pure finite conditionals — collapse to guarded polys (issue #70).
+    entries.append(CatalogEntry("select_by_sign(7)", *P.make_select_by_sign(7)))
+    entries.append(CatalogEntry("clamp_zero(5)",     *P.make_clamp_zero(5)))
+    entries.append(CatalogEntry("either_or(3,7,1)",  *P.make_either_or(3, 7, 1)))
+
+    # Still blocked — non-polynomial op.
     entries.append(CatalogEntry("native_max(3,5)", *P.make_native_max(3, 5)))
 
     return entries
@@ -238,10 +323,13 @@ class CatalogRow:
     n_heads: int = 0
     n_monomials: Optional[int] = None
     poly_expr: Optional[str] = None
-    eml_size: Optional[int] = None
-    eml_depth: Optional[int] = None
+    eml_size: Optional[int] = None           # sum across cases for guarded
+    eml_depth: Optional[int] = None          # max across cases for guarded
     numpy_top: Optional[int] = None
     numeric_match: Optional[bool] = None
+    # Guarded-specific fields (issue #70).
+    n_cases: Optional[int] = None
+    case_exprs: Optional[List[str]] = None   # ["guard => value", ...]
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -252,13 +340,53 @@ def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
     return trace.steps[-1].top if trace.steps else None
 
 
+def _guard_to_expr(guard: Guard) -> str:
+    """Human-readable rendering of a single Guard (poly op 0)."""
+    op = "== 0" if guard.eq_zero else "!= 0"
+    return f"{poly_to_expr(guard.poly)} {op}"
+
+
+def _guards_to_expr(guards) -> str:
+    if not guards:
+        return "True"
+    return " ∧ ".join(_guard_to_expr(g) for g in guards)
+
+
+def _eval_poly_safe(p: Poly, bindings: Dict[int, int]) -> int:
+    """Evaluate a Poly. Missing variables default to 0 (concrete-mode rows)."""
+    try:
+        return p.eval_at(bindings)
+    except KeyError:
+        missing = {v: 0 for v in p.variables() if v not in bindings}
+        return p.eval_at({**bindings, **missing})
+
+
+def _compile_poly(poly: Poly):
+    """Compile a Poly to an EML tree. Returns (tree, var_names)."""
+    expr = poly_to_expr(poly)
+    vars_in_poly = poly.variables()
+    if vars_in_poly:
+        return compile_expr(expr, variables=[f"x{v}" for v in vars_in_poly]), vars_in_poly
+    return compile_expr(expr), []
+
+
+def _three_way_numeric_match(numpy_top, sym_val, eml_val) -> bool:
+    if eml_val is None:
+        return numpy_top == sym_val
+    if abs(eml_val.imag) > 1e-6:
+        return False
+    return numpy_top == sym_val == int(round(eml_val.real))
+
+
 def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
                 np_exec: Optional[NumPyExecutor] = None) -> List[CatalogRow]:
     """Classify every entry, populate EML columns where possible.
 
-    For ``collapsed`` rows the three-way cross-check is
+    For collapsed / guarded / unrolled rows the three-way cross-check is
     ``NumPy top == Poly.eval_at(bindings) == eval_eml(compiled_tree)`` —
-    ``numeric_match`` is True only when all three agree.
+    ``numeric_match`` is True only when all three agree. For guarded
+    rows the check runs per-case on each case's `value_poly`, restricted
+    to the concrete bindings that satisfy that case's guards.
     """
     entries = entries if entries is not None else _default_catalog()
     np_exec = np_exec or NumPyExecutor()
@@ -271,67 +399,155 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         row.n_heads = cr.n_heads
         row.numpy_top = _numpy_top(np_exec, entry.prog)
 
-        if cr.status != "collapsed":
-            rows.append(row)
-            continue
+        if cr.status == STATUS_COLLAPSED or cr.status == STATUS_COLLAPSED_UNROLLED:
+            if cr.poly is not None:
+                _fill_poly_row(row, cr.poly, cr.bindings, row.numpy_top)
+            elif cr.guarded is not None:
+                # Unrolled + guarded (rare) — fall through to guarded formatter
+                _fill_guarded_row(row, cr.guarded, cr.bindings, row.numpy_top)
+        elif cr.status == STATUS_COLLAPSED_GUARDED:
+            assert cr.guarded is not None
+            _fill_guarded_row(row, cr.guarded, cr.bindings, row.numpy_top)
+        # Otherwise: row stays minimally populated (blocker-only).
 
-        assert cr.poly is not None
-        row.n_monomials = cr.poly.n_monomials()
-        row.poly_expr = poly_to_expr(cr.poly)
-
-        sym_val = cr.poly.eval_at(cr.bindings) if cr.bindings else 0
-        if cr.poly.n_monomials() and not cr.bindings:
-            # constant Poly — bindings may still be empty, evaluate at {}
-            sym_val = cr.poly.eval_at({})
-        checks = [row.numpy_top == sym_val]
-
-        if _EML_AVAILABLE:
-            vars_in_poly = cr.poly.variables()
-            if vars_in_poly:
-                tree = compile_expr(
-                    row.poly_expr,
-                    variables=[f"x{v}" for v in vars_in_poly],
-                )
-                eml_bindings = {f"x{v}": cr.bindings[v] for v in vars_in_poly}
-            else:
-                tree = compile_expr(row.poly_expr)
-                eml_bindings = {}
-            row.eml_size = tree_size(tree)
-            row.eml_depth = tree_depth(tree)
-            eml_val = eval_eml(tree, eml_bindings)
-            checks.append(
-                abs(eml_val.imag) < 1e-6
-                and int(round(eml_val.real)) == sym_val
-            )
-
-        row.numeric_match = all(checks)
         rows.append(row)
     return rows
+
+
+def _fill_poly_row(row: CatalogRow, poly: Poly,
+                   bindings: Dict[int, int],
+                   numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from a single Poly top (collapsed / unrolled)."""
+    row.n_monomials = poly.n_monomials()
+    row.poly_expr = poly_to_expr(poly)
+
+    sym_val = _eval_poly_safe(poly, bindings)
+    eml_val = None
+    if _EML_AVAILABLE:
+        tree, _ = _compile_poly(poly)
+        row.eml_size = tree_size(tree)
+        row.eml_depth = tree_depth(tree)
+        eml_bindings = {f"x{v}": bindings[v] for v in poly.variables()
+                        if v in bindings}
+        eml_val = eval_eml(tree, eml_bindings) if eml_bindings or not poly.variables() else None
+    row.numeric_match = _three_way_numeric_match(numpy_top, sym_val, eml_val)
+
+
+def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
+                      bindings: Dict[int, int],
+                      numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from a GuardedPoly (collapsed_guarded).
+
+    For each case we compile ``value_poly`` to its own EML tree. The row's
+    ``eml_size`` is the sum across cases (honest total work) and
+    ``eml_depth`` is the max across cases (honest worst case).
+    """
+    row.n_cases = guarded.n_cases()
+    row.n_monomials = sum(v.n_monomials() for _, v in guarded.cases)
+    row.case_exprs = [
+        f"{{{_guards_to_expr(gs)}}} → {poly_to_expr(v)}"
+        for gs, v in guarded.cases
+    ]
+    row.poly_expr = " ; ".join(row.case_exprs)
+
+    # Per-case three-way check. Exactly one case's guards hold at the
+    # concrete bindings we have.
+    sym_val = guarded.eval_at(bindings) if bindings else None
+
+    sizes: List[int] = []
+    depths: List[int] = []
+    eml_vals_per_case = []
+    if _EML_AVAILABLE:
+        for gs, v in guarded.cases:
+            tree, _ = _compile_poly(v)
+            sizes.append(tree_size(tree))
+            depths.append(tree_depth(tree))
+            case_bindings = {f"x{i}": bindings[i] for i in v.variables()
+                             if i in bindings}
+            if v.variables() and not case_bindings:
+                eml_vals_per_case.append(None)
+            else:
+                eml_vals_per_case.append(eval_eml(tree, case_bindings))
+        row.eml_size = sum(sizes)
+        row.eml_depth = max(depths) if depths else 0
+
+    # numeric_match: for each case pick the one whose guards hold;
+    # compare numpy_top, that case's poly eval, and that case's eml eval.
+    match = True
+    hit = False
+    for idx, (gs, v) in enumerate(guarded.cases):
+        if not bindings:
+            continue
+        ok = True
+        for g in gs:
+            gv = _eval_poly_safe(g.poly, bindings)
+            if g.eq_zero and gv != 0:
+                ok = False; break
+            if not g.eq_zero and gv == 0:
+                ok = False; break
+        if not ok:
+            continue
+        hit = True
+        case_sym = _eval_poly_safe(v, bindings)
+        case_eml = eml_vals_per_case[idx] if _EML_AVAILABLE else None
+        if not _three_way_numeric_match(numpy_top, case_sym, case_eml):
+            match = False
+        break
+    row.numeric_match = match and hit if bindings else None
 
 
 # ─── Reporting ────────────────────────────────────────────────────
 
 _BLOCK_REASON = {
-    "blocked_control":   "control flow",
-    "blocked_opcode":    "non-polynomial op",
-    "blocked_underflow": "stack underflow",
+    STATUS_BLOCKED_OPCODE:    "non-polynomial op",
+    STATUS_BLOCKED_UNDERFLOW: "stack underflow",
+    STATUS_BLOCKED_LOOP_SYM:  "loop with symbolic trip count",
+    STATUS_BLOCKED_PATH_EXP:  "path explosion",
 }
+
+
+def _fmt_eml(n):
+    return "–" if n is None else str(n)
+
+
+def _fmt_match(m):
+    return "–" if m is None else ("✓" if m else "✗")
 
 
 def format_report(rows: List[CatalogRow]) -> str:
     """Render a markdown-style catalog report from :func:`run_catalog` rows."""
-    n_collapsed = sum(1 for r in rows if r.status == "collapsed")
-    n_control = sum(1 for r in rows if r.status == "blocked_control")
-    n_opcode = sum(1 for r in rows if r.status == "blocked_opcode")
-    n_other = len(rows) - n_collapsed - n_control - n_opcode
+    n_collapsed = sum(1 for r in rows if r.status == STATUS_COLLAPSED)
+    n_guarded = sum(1 for r in rows if r.status == STATUS_COLLAPSED_GUARDED)
+    n_unrolled = sum(1 for r in rows if r.status == STATUS_COLLAPSED_UNROLLED)
+    n_loop_sym = sum(1 for r in rows if r.status == STATUS_BLOCKED_LOOP_SYM)
+    n_opcode = sum(1 for r in rows if r.status == STATUS_BLOCKED_OPCODE)
+    n_other = len(rows) - n_collapsed - n_guarded - n_unrolled - n_loop_sym - n_opcode
+
+    summary_parts = [
+        f"{n_collapsed} collapsed",
+        f"{n_guarded} guarded",
+        f"{n_unrolled} unrolled",
+        f"{n_loop_sym} loop-symbolic",
+        f"{n_opcode} blocked-by-opcode",
+    ]
+    if n_other:
+        summary_parts.append(f"{n_other} other")
 
     lines = [
         "# LAC program catalog — symbolic collapse report",
         "",
-        f"_{n_collapsed} collapsed, {n_control} blocked-by-branch, "
-        f"{n_opcode} blocked-by-opcode"
-        + (f", {n_other} other" if n_other else "")
-        + f" (total {len(rows)})._",
+        "_" + " | ".join(summary_parts) + f" (total {len(rows)})._",
+        "",
+        "**Reading the status columns.** _Collapsed_ rows are straight-line",
+        "programs that reduce to a single polynomial (the issue-#65 claim).",
+        "_Guarded_ rows contain finite conditionals (JZ/JNZ on symbolic",
+        "inputs) and reduce to a `GuardedPoly` — a partitioned case table",
+        "whose cases together cover the domain. _Unrolled_ rows contain",
+        "bounded loops with concrete trip counts: the executor runs them",
+        "in `input_mode=\"concrete\"` (every PUSH is specialised to its",
+        "literal arg) so the loop unrolls by execution rather than by",
+        "invariant inference. \"Unrolled at n=5\" is therefore a claim",
+        "about a specific input, **not** a symbolic proof over all n.",
         "",
     ]
     if not _EML_AVAILABLE:
@@ -344,14 +560,49 @@ def format_report(rows: List[CatalogRow]) -> str:
         "|---|---:|---:|---|---:|---:|:-:|",
     ]
     for r in rows:
-        if r.status != "collapsed":
+        if r.status != STATUS_COLLAPSED:
             continue
-        size = "–" if r.eml_size is None else str(r.eml_size)
-        depth = "–" if r.eml_depth is None else str(r.eml_depth)
-        ok = "–" if r.numeric_match is None else ("✓" if r.numeric_match else "✗")
         lines.append(
             f"| `{r.name}` | {r.n_heads} | {r.n_monomials} | "
-            f"`{r.poly_expr}` | {size} | {depth} | {ok} |"
+            f"`{r.poly_expr}` | {_fmt_eml(r.eml_size)} | "
+            f"{_fmt_eml(r.eml_depth)} | {_fmt_match(r.numeric_match)} |"
+        )
+
+    lines += [
+        "",
+        "## Collapsed (guarded — finite conditionals)",
+        "",
+        "Each case is `guards ⇒ value_poly`. The `eml size` column sums",
+        "across cases (total EML nodes to realise every branch); the",
+        "`eml depth` column reports the deepest single case.",
+        "",
+        "| Program | k heads | # cases | cases | eml size | eml depth | match |",
+        "|---|---:|---:|---|---:|---:|:-:|",
+    ]
+    for r in rows:
+        if r.status != STATUS_COLLAPSED_GUARDED:
+            continue
+        cases_md = "<br>".join(f"`{c}`" for c in (r.case_exprs or []))
+        lines.append(
+            f"| `{r.name}` | {r.n_heads} | {r.n_cases} | {cases_md} | "
+            f"{_fmt_eml(r.eml_size)} | {_fmt_eml(r.eml_depth)} | "
+            f"{_fmt_match(r.numeric_match)} |"
+        )
+
+    lines += [
+        "",
+        "## Collapsed (unrolled at the catalog's concrete inputs)",
+        "",
+        "| Program | k heads | # mono | poly | eml size | eml depth | match |",
+        "|---|---:|---:|---|---:|---:|:-:|",
+    ]
+    for r in rows:
+        if r.status != STATUS_COLLAPSED_UNROLLED:
+            continue
+        lines.append(
+            f"| `{r.name}` | {r.n_heads} | {r.n_monomials} | "
+            f"`{r.poly_expr}` | {_fmt_eml(r.eml_size)} | "
+            f"{_fmt_eml(r.eml_depth)} | {_fmt_match(r.numeric_match)} |"
         )
 
     lines += [
@@ -362,10 +613,12 @@ def format_report(rows: List[CatalogRow]) -> str:
         "|---|---|---|",
     ]
     for r in rows:
-        if r.status == "collapsed" or r.status == "":
+        if r.status in (STATUS_COLLAPSED, STATUS_COLLAPSED_GUARDED,
+                         STATUS_COLLAPSED_UNROLLED) or r.status == "":
             continue
         reason = _BLOCK_REASON.get(r.status, r.status)
-        lines.append(f"| `{r.name}` | {reason} | `{r.blocker}` |")
+        blocker = r.blocker if r.blocker else "–"
+        lines.append(f"| `{r.name}` | {reason} | `{blocker}` |")
 
     return "\n".join(lines) + "\n"
 
@@ -387,6 +640,13 @@ __all__ = [
     "CatalogEntry",
     "CatalogRow",
     "ClassificationResult",
+    "STATUS_COLLAPSED",
+    "STATUS_COLLAPSED_GUARDED",
+    "STATUS_COLLAPSED_UNROLLED",
+    "STATUS_BLOCKED_OPCODE",
+    "STATUS_BLOCKED_UNDERFLOW",
+    "STATUS_BLOCKED_LOOP_SYM",
+    "STATUS_BLOCKED_PATH_EXP",
     "classify_program",
     "format_report",
     "poly_to_expr",
