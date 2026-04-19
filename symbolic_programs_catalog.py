@@ -316,6 +316,22 @@ def _default_catalog() -> List[CatalogEntry]:
 # ─── Runner + row ────────────────────────────────────────────────
 
 @dataclass
+class GuardedCaseEML:
+    """Per-case EML accounting for one branch of a :class:`GuardedPoly`.
+
+    ``value_size`` / ``value_depth`` describe the EML tree compiled from
+    the case's ``value_poly``. ``guard_sizes`` / ``guard_depths`` describe
+    the EML trees compiled from each :class:`Guard` in the case's
+    conjunction (one entry per guard, in the order the executor produced
+    them). Populated only when eml-sr is importable; ``None`` otherwise.
+    """
+    value_size: int
+    value_depth: int
+    guard_sizes: List[int]
+    guard_depths: List[int]
+
+
+@dataclass
 class CatalogRow:
     name: str
     status: str
@@ -323,13 +339,17 @@ class CatalogRow:
     n_heads: int = 0
     n_monomials: Optional[int] = None
     poly_expr: Optional[str] = None
-    eml_size: Optional[int] = None           # sum across cases for guarded
-    eml_depth: Optional[int] = None          # max across cases for guarded
+    eml_size: Optional[int] = None           # sum of value-poly sizes for guarded
+    eml_depth: Optional[int] = None          # max of value-poly depths for guarded
     numpy_top: Optional[int] = None
     numeric_match: Optional[bool] = None
     # Guarded-specific fields (issue #70).
     n_cases: Optional[int] = None
     case_exprs: Optional[List[str]] = None   # ["guard => value", ...]
+    # Sharper guarded accounting (issue #68 S2).
+    eml_guard_size: Optional[int] = None     # sum of guard-poly sizes across every case
+    eml_guard_depth: Optional[int] = None    # max guard-poly depth across every case
+    case_eml: Optional[List[GuardedCaseEML]] = None
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -438,9 +458,13 @@ def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
                       numpy_top: Optional[int]) -> None:
     """Populate a CatalogRow from a GuardedPoly (collapsed_guarded).
 
-    For each case we compile ``value_poly`` to its own EML tree. The row's
-    ``eml_size`` is the sum across cases (honest total work) and
-    ``eml_depth`` is the max across cases (honest worst case).
+    For each case we compile both the ``value_poly`` and every
+    :class:`Guard` poly in its conjunction to their own EML trees. The
+    row's ``eml_size`` / ``eml_depth`` continue to describe the **value**
+    trees (sum / max) — unchanged since S1 — while ``eml_guard_size`` /
+    ``eml_guard_depth`` describe the **guard** trees (sum / max), making
+    the dispatch cost explicit rather than free. ``case_eml`` carries the
+    per-case breakdown for callers that want to see individual numbers.
     """
     row.n_cases = guarded.n_cases()
     row.n_monomials = sum(v.n_monomials() for _, v in guarded.cases)
@@ -456,12 +480,34 @@ def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
 
     sizes: List[int] = []
     depths: List[int] = []
+    guard_sizes_total: List[int] = []
+    guard_depths_total: List[int] = []
     eml_vals_per_case = []
+    case_eml: List[GuardedCaseEML] = []
     if _EML_AVAILABLE:
         for gs, v in guarded.cases:
             tree, _ = _compile_poly(v)
-            sizes.append(tree_size(tree))
-            depths.append(tree_depth(tree))
+            v_size = tree_size(tree)
+            v_depth = tree_depth(tree)
+            sizes.append(v_size)
+            depths.append(v_depth)
+
+            # Compile every guard poly in this case's conjunction.
+            per_case_gsizes: List[int] = []
+            per_case_gdepths: List[int] = []
+            for g in gs:
+                g_tree, _ = _compile_poly(g.poly)
+                per_case_gsizes.append(tree_size(g_tree))
+                per_case_gdepths.append(tree_depth(g_tree))
+            guard_sizes_total.extend(per_case_gsizes)
+            guard_depths_total.extend(per_case_gdepths)
+
+            case_eml.append(GuardedCaseEML(
+                value_size=v_size, value_depth=v_depth,
+                guard_sizes=per_case_gsizes,
+                guard_depths=per_case_gdepths,
+            ))
+
             case_bindings = {f"x{i}": bindings[i] for i in v.variables()
                              if i in bindings}
             if v.variables() and not case_bindings:
@@ -470,6 +516,9 @@ def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
                 eml_vals_per_case.append(eval_eml(tree, case_bindings))
         row.eml_size = sum(sizes)
         row.eml_depth = max(depths) if depths else 0
+        row.eml_guard_size = sum(guard_sizes_total)
+        row.eml_guard_depth = max(guard_depths_total) if guard_depths_total else 0
+        row.case_eml = case_eml
 
     # numeric_match: for each case pick the one whose guards hold;
     # compare numpy_top, that case's poly eval, and that case's eml eval.
@@ -572,12 +621,18 @@ def format_report(rows: List[CatalogRow]) -> str:
         "",
         "## Collapsed (guarded — finite conditionals)",
         "",
-        "Each case is `guards ⇒ value_poly`. The `eml size` column sums",
-        "across cases (total EML nodes to realise every branch); the",
-        "`eml depth` column reports the deepest single case.",
+        "Each case is `guards ⇒ value_poly`. Guarded dispatch has two",
+        "EML costs: the **value** trees (one per case's ``value_poly``)",
+        "and the **guard** trees (one per :class:`Guard` in every case's",
+        "conjunction). Both are reported separately rather than rolled",
+        "together — so the \"what does one execution cost?\" number and",
+        "the \"what does it take to realise the whole case table?\"",
+        "number stay distinguishable. _value Σ size_ / _value max depth_",
+        "sum and max across cases' value trees; _guard Σ size_ / _guard",
+        "max depth_ do the same across every guard tree.",
         "",
-        "| Program | k heads | # cases | cases | eml size | eml depth | match |",
-        "|---|---:|---:|---|---:|---:|:-:|",
+        "| Program | k heads | # cases | cases | value Σ size | value max depth | guard Σ size | guard max depth | match |",
+        "|---|---:|---:|---|---:|---:|---:|---:|:-:|",
     ]
     for r in rows:
         if r.status != STATUS_COLLAPSED_GUARDED:
@@ -586,6 +641,7 @@ def format_report(rows: List[CatalogRow]) -> str:
         lines.append(
             f"| `{r.name}` | {r.n_heads} | {r.n_cases} | {cases_md} | "
             f"{_fmt_eml(r.eml_size)} | {_fmt_eml(r.eml_depth)} | "
+            f"{_fmt_eml(r.eml_guard_size)} | {_fmt_eml(r.eml_guard_depth)} | "
             f"{_fmt_match(r.numeric_match)} |"
         )
 
@@ -640,6 +696,7 @@ __all__ = [
     "CatalogEntry",
     "CatalogRow",
     "ClassificationResult",
+    "GuardedCaseEML",
     "STATUS_COLLAPSED",
     "STATUS_COLLAPSED_GUARDED",
     "STATUS_COLLAPSED_UNROLLED",
