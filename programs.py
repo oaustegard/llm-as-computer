@@ -466,6 +466,62 @@ def make_native_clamp(val, lo, hi):
     return prog, expected
 
 
+# ─── Finite-Conditional Program Generators (issue #70) ─────────
+#
+# Pure-branching demo programs — no loops — that exercise the
+# symbolic executor's guarded-trace extension. Each collapses to a
+# `GuardedPoly` with two cases when run symbolically.
+
+def make_select_by_sign(a):
+    """Return 1 if a == 0 else 2 — single finite conditional, no loop."""
+    prog = [
+        Instruction(OP_PUSH, a),    # 0: a
+        Instruction(OP_DUP),        # 1: [a, a]
+        Instruction(OP_JZ, 6),      # 2: pop a; if 0 -> 6 (zero branch)
+        Instruction(OP_POP),        # 3: drop a
+        Instruction(OP_PUSH, 2),    # 4: non-zero result
+        Instruction(OP_HALT),       # 5
+        # ── a == 0 branch (addr 6) ──
+        Instruction(OP_POP),        # 6: drop a
+        Instruction(OP_PUSH, 1),    # 7: zero result
+        Instruction(OP_HALT),       # 8
+    ]
+    return prog, 1 if a == 0 else 2
+
+
+def make_clamp_zero(a):
+    """Return 0 if a == 0 else a — value-returning finite conditional."""
+    prog = [
+        Instruction(OP_PUSH, a),    # 0: a
+        Instruction(OP_DUP),        # 1: [a, a]
+        Instruction(OP_JZ, 4),      # 2: pop; if 0 -> 4
+        Instruction(OP_HALT),       # 3: non-zero: stack = [a]
+        # ── a == 0 branch (addr 4) ──
+        Instruction(OP_POP),        # 4: drop the zero that's left
+        Instruction(OP_PUSH, 0),    # 5
+        Instruction(OP_HALT),       # 6
+    ]
+    return prog, 0 if a == 0 else a
+
+
+def make_either_or(a, b, pick):
+    """Return a if pick == 0 else b — three-input finite conditional."""
+    prog = [
+        Instruction(OP_PUSH, a),    # 0: a
+        Instruction(OP_PUSH, b),    # 1: [a, b]
+        Instruction(OP_PUSH, pick), # 2: [a, b, pick]
+        Instruction(OP_JZ, 7),      # 3: pop pick; if 0 -> 7 (a branch)
+        # ── pick != 0 branch ──
+        Instruction(OP_SWAP),       # 4: [b, a]
+        Instruction(OP_POP),        # 5: drop a, stack = [b]
+        Instruction(OP_HALT),       # 6
+        # ── pick == 0 branch (addr 7) ──
+        Instruction(OP_POP),        # 7: drop b, stack = [a]
+        Instruction(OP_HALT),       # 8
+    ]
+    return prog, a if pick == 0 else b
+
+
 # ─── Bitwise Program Generators ─────────────────────────────────
 
 def make_bitwise_binary(op, a, b):
