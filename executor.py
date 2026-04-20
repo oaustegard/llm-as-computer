@@ -906,6 +906,20 @@ class CompiledModel(nn.Module):
         """
         return ff_symbolic.evaluate_program(prog)
 
+    def forward_symbolic_forking(self, prog, *, input_mode="symbolic"):
+        """Run ``prog`` through the forking executor with the bilinear-FF
+        primitives (issue #68 S3).
+
+        Extends :meth:`forward_symbolic` past the branchless fragment by
+        delegating to :func:`ff_symbolic.evaluate_program_forking`, which
+        drives :func:`symbolic_executor.run_forking` with this module's
+        ADD/SUB/MUL ops. Accepts JZ/JNZ — returns a
+        :class:`symbolic_executor.ForkingResult` whose ``top`` is a
+        :class:`Poly` (straight-line / unrolled) or
+        :class:`symbolic_executor.GuardedPoly` (guarded).
+        """
+        return ff_symbolic.evaluate_program_forking(prog, input_mode=input_mode)
+
 
 # ─── PyTorch Executor ────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""Tests for ff_symbolic (issue #69).
+"""Tests for ff_symbolic (issue #69 + issue #68 S3).
 
 Verifies the bilinear FF dispatch realises the same polynomial the symbolic
 executor emits — not just numerically, but *structurally*. For every
@@ -7,12 +7,19 @@ collapsed catalog program, the test asserts
 equality (value-compare), alongside a numerical agreement check against
 :class:`NumPyExecutor` on concrete inputs.
 
+S3 extends the cross-check past the branchless fragment: guarded programs
+(JZ/JNZ on symbolic conditions) and unrolled programs (bounded loops at
+concrete inputs) are driven through the forking executor with the bilinear
+FF primitives, and compared structurally against the symbolic executor's
+native ``run_forking``.
+
 Layout:
   * ``test_primitives_*`` — unit-level checks on E / M_ADD / M_SUB / B_MUL.
   * ``test_range_check`` — Option (a) bound enforcement.
   * ``test_equivalence_*`` — the core equivalence theorem, parametrised
     over every row in ``symbolic_programs_catalog`` whose status is
-    ``STATUS_COLLAPSED``.
+    ``STATUS_COLLAPSED``. The ``_guarded_*`` / ``_unrolled_*`` variants
+    cover ``STATUS_COLLAPSED_GUARDED`` / ``STATUS_COLLAPSED_UNROLLED``.
   * ``test_blocked_opcodes`` — non-polynomial ops are rejected rather than
     silently returning a wrong-but-plausible Poly.
 """
@@ -29,9 +36,11 @@ import ff_symbolic as ff
 import isa
 from executor import CompiledModel, NumPyExecutor
 from isa import DIM_VALUE, program
-from symbolic_executor import Poly, run_symbolic
+from symbolic_executor import GuardedPoly, Poly, run_forking, run_symbolic
 from symbolic_programs_catalog import (
     STATUS_COLLAPSED,
+    STATUS_COLLAPSED_GUARDED,
+    STATUS_COLLAPSED_UNROLLED,
     _default_catalog,
     classify_program,
 )
@@ -160,6 +169,37 @@ def _collapsed_entries():
     return out
 
 
+def _guarded_entries():
+    """Catalog entries classified STATUS_COLLAPSED_GUARDED.
+
+    Exercises the S3 cross-check (issue #68): bilinear FF primitives
+    must produce the same :class:`GuardedPoly` as the symbolic executor
+    when JZ/JNZ branches fork on symbolic conditions.
+    """
+    out = []
+    for entry in _default_catalog():
+        cr = classify_program(entry.prog)
+        if cr.status == STATUS_COLLAPSED_GUARDED and cr.guarded is not None:
+            out.append((entry, cr))
+    return out
+
+
+def _unrolled_entries():
+    """Catalog entries classified STATUS_COLLAPSED_UNROLLED.
+
+    Exercises the S3 cross-check (issue #68): bilinear FF primitives
+    under ``input_mode="concrete"`` must produce the same final Poly
+    the symbolic executor produces when bounded loops unroll under
+    concrete inputs.
+    """
+    out = []
+    for entry in _default_catalog():
+        cr = classify_program(entry.prog)
+        if cr.status == STATUS_COLLAPSED_UNROLLED:
+            out.append((entry, cr))
+    return out
+
+
 def test_equivalence_structural():
     """Core equivalence: forward_symbolic.top == run_symbolic.top, per catalog row.
 
@@ -211,6 +251,152 @@ def test_equivalence_numeric():
             f"numeric[{entry.name}]",
             sym_val == np_top,
             f"sym_val={sym_val}, np_top={np_top}",
+        )
+
+
+# ─── Guarded / unrolled equivalence (issue #68 S3) ────────────────
+#
+# Structural: the forking executor with the bilinear FF primitives
+# plugged in must produce the same ``top`` (a :class:`Poly` or
+# :class:`GuardedPoly`) as the symbolic executor's native ``run_forking``.
+# ``symbolic_add/sub/mul`` are defined as the Poly-level interpretation
+# of ``M_ADD`` / ``M_SUB`` / ``B_MUL``; S3 extends the equivalence past
+# branchless straight-line code into JZ/JNZ control flow and bounded
+# loop unrolling.
+#
+# Numeric: the live case's value polynomial, evaluated at the concrete
+# bindings, must equal :class:`NumPyExecutor`'s top. The compiled
+# transformer's numeric forward path already routes ADD/SUB/MUL through
+# ``forward_add/sub/mul`` (see ``executor.py`` lines 826-833), so this
+# check completes the three-way agreement per guarded / unrolled row.
+
+
+def test_equivalence_guarded_structural():
+    """Forking FF == forking symbolic, structurally, on every guarded row."""
+    model = CompiledModel()
+    entries = _guarded_entries()
+    _check("catalog has guarded entries", len(entries) > 0,
+           f"expected >0, got {len(entries)}")
+    for entry, _cr in entries:
+        sym = run_forking(entry.prog, input_mode="symbolic")
+        ff_res = model.forward_symbolic_forking(entry.prog, input_mode="symbolic")
+        _check(
+            f"guarded.status[{entry.name}]",
+            sym.status == ff_res.status,
+            f"sym={sym.status}, ff={ff_res.status}",
+        )
+        _check(
+            f"guarded.top[{entry.name}]",
+            sym.top == ff_res.top,
+            f"sym.top={sym.top!r} vs ff.top={ff_res.top!r}",
+        )
+        _check(
+            f"guarded.n_heads[{entry.name}]",
+            sym.n_heads == ff_res.n_heads,
+            f"sym={sym.n_heads}, ff={ff_res.n_heads}",
+        )
+
+
+def test_equivalence_guarded_numeric():
+    """For the live case under the catalog's bindings: sym == np == ff-numeric.
+
+    The FF-wired numeric forward path runs each trace step through the
+    bilinear matrices; ``TorchExecutor`` drives that loop. The three-way
+    agreement here is the numeric counterpart of the structural claim.
+    """
+    from executor import TorchExecutor
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+    torch_exec = TorchExecutor(model)
+    for entry, cr in _guarded_entries():
+        guarded: GuardedPoly = cr.guarded  # type: ignore[assignment]
+        bindings = cr.bindings
+        if not bindings:
+            continue  # no concrete bindings → nothing to evaluate numerically
+
+        np_trace = np_exec.execute(entry.prog)
+        np_top = np_trace.steps[-1].top if np_trace.steps else None
+        t_trace = torch_exec.execute(entry.prog)
+        t_top = t_trace.steps[-1].top if t_trace.steps else None
+
+        try:
+            sym_val = guarded.eval_at(bindings)
+        except ValueError as e:
+            _fail(f"guarded.numeric[{entry.name}]", f"eval_at: {e}")
+            continue
+        _check(
+            f"guarded.sym==np[{entry.name}]",
+            sym_val == np_top,
+            f"sym={sym_val}, np={np_top}",
+        )
+        _check(
+            f"guarded.np==ff[{entry.name}]",
+            np_top == t_top,
+            f"np={np_top}, ff(numeric)={t_top}",
+        )
+
+
+def test_equivalence_unrolled_structural():
+    """Forking FF == forking symbolic, structurally, on every unrolled row.
+
+    Uses ``input_mode="concrete"`` — matches how ``classify_program``
+    collapses unrolled programs.
+    """
+    model = CompiledModel()
+    entries = _unrolled_entries()
+    _check("catalog has unrolled entries", len(entries) > 0,
+           f"expected >0, got {len(entries)}")
+    for entry, _cr in entries:
+        sym = run_forking(entry.prog, input_mode="concrete")
+        ff_res = model.forward_symbolic_forking(entry.prog, input_mode="concrete")
+        _check(
+            f"unrolled.status[{entry.name}]",
+            sym.status == ff_res.status,
+            f"sym={sym.status}, ff={ff_res.status}",
+        )
+        _check(
+            f"unrolled.top[{entry.name}]",
+            sym.top == ff_res.top,
+            f"sym.top={sym.top!r} vs ff.top={ff_res.top!r}",
+        )
+        _check(
+            f"unrolled.n_heads[{entry.name}]",
+            sym.n_heads == ff_res.n_heads,
+            f"sym={sym.n_heads}, ff={ff_res.n_heads}",
+        )
+
+
+def test_equivalence_unrolled_numeric():
+    """sym (eval'd at concrete bindings) == np == ff-numeric per unrolled row."""
+    from executor import TorchExecutor
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+    torch_exec = TorchExecutor(model)
+    for entry, cr in _unrolled_entries():
+        np_trace = np_exec.execute(entry.prog)
+        np_top = np_trace.steps[-1].top if np_trace.steps else None
+        t_trace = torch_exec.execute(entry.prog)
+        t_top = t_trace.steps[-1].top if t_trace.steps else None
+
+        if cr.poly is not None:
+            # Concrete-mode polys have no free variables (every PUSH
+            # specialised to its literal); eval_at({}) collapses them.
+            sym_val = cr.poly.eval_at({})
+        elif cr.guarded is not None:
+            # Rare: unrolled program still produced guarded output.
+            sym_val = cr.guarded.eval_at({}) if not cr.guarded.variables() else None
+        else:
+            sym_val = None
+        if sym_val is not None:
+            _check(
+                f"unrolled.sym==np[{entry.name}]",
+                sym_val == np_top,
+                f"sym={sym_val}, np={np_top}",
+            )
+        _check(
+            f"unrolled.np==ff[{entry.name}]",
+            np_top == t_top,
+            f"np={np_top}, ff(numeric)={t_top}",
         )
 
 
@@ -299,6 +485,10 @@ def main():
         test_range_check,
         test_equivalence_structural,
         test_equivalence_numeric,
+        test_equivalence_guarded_structural,
+        test_equivalence_guarded_numeric,
+        test_equivalence_unrolled_structural,
+        test_equivalence_unrolled_numeric,
         test_dup_add_chain_pin,
         test_sum_of_squares_pin,
         test_blocked_opcodes,

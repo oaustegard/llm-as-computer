@@ -62,7 +62,12 @@ import torch
 
 import isa
 from isa import DIM_VALUE, D_MODEL, DTYPE
-from symbolic_executor import Poly
+from symbolic_executor import (
+    ArithmeticOps,
+    ForkingResult,
+    Poly,
+    run_forking,
+)
 
 
 # ─── Exceptions ────────────────────────────────────────────────────
@@ -245,6 +250,20 @@ def symbolic_mul(pa: Poly, pb: Poly) -> Poly:
     return pa * pb
 
 
+# Triple of bilinear-FF primitives, packaged for
+# :func:`symbolic_executor.run_forking`'s ``arithmetic_ops`` hook
+# (issue #68 S3). ``symbolic_sub`` returns ``pb - pa`` to match the
+# FF dispatch order (``va`` is top, ``vb`` is stack[SP-1]); the
+# forking executor's internal order is ``a - b`` where ``a`` is
+# stack[SP-1] and ``b`` is top, so we bind ``sub=lambda a, b:
+# symbolic_sub(b, a)`` to keep the two orders aligned.
+FF_ARITHMETIC_OPS = ArithmeticOps(
+    add=lambda a, b: symbolic_add(a, b),
+    sub=lambda a, b: symbolic_sub(b, a),
+    mul=lambda a, b: symbolic_mul(a, b),
+)
+
+
 # ─── Program-level symbolic forward ───────────────────────────────
 #
 # ``CompiledModel.forward_symbolic`` delegates to :func:`evaluate_program`
@@ -348,6 +367,30 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                                  n_heads=n_heads, bindings=bindings)
 
 
+def evaluate_program_forking(prog, *, input_mode: str = "symbolic") -> ForkingResult:
+    """Run ``prog`` through :func:`symbolic_executor.run_forking` with the
+    bilinear-FF ADD/SUB/MUL primitives (issue #68 S3).
+
+    The control-flow driver (JZ/JNZ, worklist, path merging) is shared
+    with the symbolic executor's native call; only the arithmetic
+    primitives differ — they're routed through this module's
+    :func:`symbolic_add` / :func:`symbolic_sub` / :func:`symbolic_mul`,
+    the Poly-level interpretation of ``M_ADD`` / ``M_SUB`` / ``B_MUL``.
+
+    Returns a :class:`symbolic_executor.ForkingResult`. For guarded
+    programs the ``top`` is a :class:`symbolic_executor.GuardedPoly`;
+    for unrolled or straight-line programs it's a :class:`Poly`.
+
+    The equivalence claim (structural): for every catalog program
+    accepted by the forking executor, this function's output is
+    structurally equal to :func:`symbolic_executor.run_forking`'s.
+    Verified by ``test_ff_symbolic.test_equivalence_guarded_*`` and
+    ``_equivalence_unrolled_*``.
+    """
+    return run_forking(prog, input_mode=input_mode,
+                       arithmetic_ops=FF_ARITHMETIC_OPS)
+
+
 __all__ = [
     "BlockedOpcodeForSymbolic",
     "RangeCheckFailure",
@@ -357,7 +400,9 @@ __all__ = [
     "n_parameters",
     "forward_add", "forward_sub", "forward_mul",
     "symbolic_add", "symbolic_sub", "symbolic_mul",
+    "FF_ARITHMETIC_OPS",
     "SymbolicForwardResult",
     "evaluate_program",
+    "evaluate_program_forking",
     "range_check",
 ]
