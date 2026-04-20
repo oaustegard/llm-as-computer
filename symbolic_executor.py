@@ -40,7 +40,7 @@ Out of scope (file as follow-ups):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import isa
 
@@ -452,6 +452,44 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
                           n_heads=n_heads, bindings=bindings)
 
 
+# ─── Arithmetic hook (issue #68 S3) ───────────────────────────────
+#
+# ``run_forking`` calls three arithmetic primitives in its inner loop —
+# one each for ADD, SUB, MUL. The default primitives are ``Poly``'s
+# native ``+ - *``; the forking driver is indifferent to which
+# implementation is plugged in as long as the signature is ``(Poly,
+# Poly) -> Poly`` and the algebra is the same.
+#
+# The hook exists so :mod:`ff_symbolic` can drive the same forking
+# executor with its bilinear-FF interpretation of the primitives
+# (``symbolic_add/sub/mul``) and demonstrate the equivalence claim
+# from issue #69 extends across JZ/JNZ control flow — not just
+# branchless straight-line programs.
+
+
+ArithFn = Callable[["Poly", "Poly"], "Poly"]
+
+
+@dataclass(frozen=True)
+class ArithmeticOps:
+    """Three-operator spec the forking executor consumes for ADD/SUB/MUL.
+
+    ``sub(a, b)`` must return ``a - b`` (executor computes ``a - b``
+    where ``a`` is the second-from-top, matching the existing Poly
+    order). ``ff_symbolic.symbolic_sub`` matches this spec.
+    """
+    add: ArithFn
+    sub: ArithFn
+    mul: ArithFn
+
+
+DEFAULT_ARITHMETIC_OPS = ArithmeticOps(
+    add=lambda a, b: a + b,
+    sub=lambda a, b: a - b,
+    mul=lambda a, b: a * b,
+)
+
+
 # ─── Forking executor (issue #70) ─────────────────────────────────
 
 # Default caps. Catalog programs stay under these comfortably; the
@@ -536,7 +574,8 @@ def _eq_guard(p: Poly, eq_zero: bool) -> Guard:
 def run_forking(prog: List[isa.Instruction], *,
                 input_mode: str = "symbolic",
                 max_paths: int = DEFAULT_MAX_PATHS,
-                max_steps: int = DEFAULT_MAX_STEPS) -> ForkingResult:
+                max_steps: int = DEFAULT_MAX_STEPS,
+                arithmetic_ops: Optional[ArithmeticOps] = None) -> ForkingResult:
     """Forking symbolic executor with finite-conditional + bounded-loop support.
 
     ``input_mode``:
@@ -546,6 +585,12 @@ def run_forking(prog: List[isa.Instruction], *,
         All branches collapse deterministically; loops unroll naturally.
         Suitable for ``collapsed_unrolled``.
 
+    ``arithmetic_ops``: override the ADD/SUB/MUL primitives applied to
+    Poly stack entries. Defaults to :data:`DEFAULT_ARITHMETIC_OPS` (plain
+    Poly ``+ - *``). :mod:`ff_symbolic` passes its bilinear-FF
+    interpretation here (issue #68 S3) to demonstrate equivalence across
+    control flow.
+
     The executor uses a worklist. Each fork splits the path into two new
     paths carrying complementary guards. When a path's top polynomial is
     concrete at a branch, the branch is followed deterministically. A
@@ -554,6 +599,7 @@ def run_forking(prog: List[isa.Instruction], *,
     """
     if input_mode not in ("symbolic", "concrete"):
         raise ValueError(f"unknown input_mode {input_mode!r}")
+    ops = arithmetic_ops if arithmetic_ops is not None else DEFAULT_ARITHMETIC_OPS
 
     # Pre-flight: reject programs with non-polynomial, non-branch opcodes.
     for instr in prog:
@@ -615,7 +661,7 @@ def run_forking(prog: List[isa.Instruction], *,
                 # Non-branch, non-halt → advance n_heads and apply op.
                 if op != isa.OP_JZ and op != isa.OP_JNZ:
                     try:
-                        stack = _apply_poly_op(path, instr, input_mode)
+                        stack = _apply_poly_op(path, instr, input_mode, ops)
                     except SymbolicStackUnderflow:
                         underflow_seen = True
                         # drop this path; don't propagate partial result
@@ -755,8 +801,14 @@ def run_forking(prog: List[isa.Instruction], *,
 
 
 def _apply_poly_op(path: _Path, instr: isa.Instruction,
-                   input_mode: str) -> Tuple[Poly, ...]:
-    """Apply a non-branch opcode to ``path.stack`` and return the new stack."""
+                   input_mode: str,
+                   arithmetic_ops: ArithmeticOps = DEFAULT_ARITHMETIC_OPS) -> Tuple[Poly, ...]:
+    """Apply a non-branch opcode to ``path.stack`` and return the new stack.
+
+    ``arithmetic_ops`` picks the ADD/SUB/MUL implementations. Defaults to
+    Poly's native operators; :mod:`ff_symbolic` passes its bilinear-FF
+    primitives.
+    """
     op = instr.op
     stack = list(path.stack)
 
@@ -778,13 +830,13 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
         stack.append(stack[-1])
     elif op == isa.OP_ADD:
         b = _pop(); a = _pop()
-        stack.append(a + b)
+        stack.append(arithmetic_ops.add(a, b))
     elif op == isa.OP_SUB:
         b = _pop(); a = _pop()
-        stack.append(a - b)
+        stack.append(arithmetic_ops.sub(a, b))
     elif op == isa.OP_MUL:
         b = _pop(); a = _pop()
-        stack.append(a * b)
+        stack.append(arithmetic_ops.mul(a, b))
     elif op == isa.OP_SWAP:
         if len(stack) < 2:
             raise SymbolicStackUnderflow(f"swap needs 2 entries at pc={path.pc}")
@@ -861,6 +913,8 @@ __all__ = [
     "SymbolicOpNotSupported",
     "SymbolicLoopSymbolic",
     "SymbolicPathExplosion",
+    "ArithmeticOps",
+    "DEFAULT_ARITHMETIC_OPS",
     "DEFAULT_MAX_PATHS",
     "DEFAULT_MAX_STEPS",
     "run_symbolic",
