@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import ff_symbolic
 from isa import (
     Instruction, Trace, TraceStep,
     CompiledAttentionHead,
@@ -815,10 +816,21 @@ class CompiledModel(nn.Module):
         vb = round(val_b.item())
 
         nonlinear = torch.zeros(N_OPCODES, dtype=DTYPE)
-        # Arithmetic ops — i32-masked per WASM overflow semantics
-        nonlinear[OPCODE_IDX[OP_ADD]] = float((va + vb) & MASK32)
-        nonlinear[OPCODE_IDX[OP_SUB]] = float((vb - va) & MASK32)
-        nonlinear[OPCODE_IDX[OP_MUL]] = float((va * vb) & MASK32)
+        # ADD / SUB / MUL: route through the bilinear FF forms from
+        # ff_symbolic (issue #69). E(v) is the scalar-at-DIM_VALUE
+        # embedding, so we lift (va, vb) back into the model's embedding
+        # space, evaluate the linear / bilinear forms, and read the
+        # scalar back. The & MASK32 step lives here, outside the form,
+        # for i32-wrap parity with NumPyExecutor — the form itself
+        # computes over Z (see ff_symbolic.range_check / equivalence proof).
+        ea = ff_symbolic.E(va, self.d_model)
+        eb = ff_symbolic.E(vb, self.d_model)
+        nonlinear[OPCODE_IDX[OP_ADD]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_add(ea, eb)) & MASK32)
+        nonlinear[OPCODE_IDX[OP_SUB]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_sub(ea, eb)) & MASK32)
+        nonlinear[OPCODE_IDX[OP_MUL]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_mul(ea, eb)) & MASK32)
         if va != 0:
             nonlinear[OPCODE_IDX[OP_DIV_S]] = float(_trunc_div(vb, va) & MASK32)
             nonlinear[OPCODE_IDX[OP_DIV_U]] = float(_trunc_div(vb, va) & MASK32)
@@ -874,6 +886,25 @@ class CompiledModel(nn.Module):
         return (opcode, arg, int(sp_delta.item()), round(top.item()),
                 opcode_one_hot, round(val_a.item()), round(val_b.item()), round(val_c.item()),
                 round(local_val.item()), round(heap_val.item()))
+
+    def forward_symbolic(self, prog):
+        """Run ``prog`` through the bilinear FF dispatch over :class:`Poly`.
+
+        The numeric :meth:`forward` evaluates the same ``M_ADD / M_SUB /
+        B_MUL`` operator tree on float tensors; this method evaluates it
+        on :class:`Poly` values. Scope is the branchless polynomial
+        fragment (see :data:`ff_symbolic._SCOPE_OPS`); anything else
+        raises :class:`ff_symbolic.BlockedOpcodeForSymbolic`.
+
+        Returns a :class:`ff_symbolic.SymbolicForwardResult`.
+
+        The equivalence theorem (issue #69) states: for every collapsed
+        catalog program P, ``forward_symbolic(P).top`` is structurally
+        equal to :func:`symbolic_executor.run_symbolic` ``(P).top``. The
+        proof is that both interpreters apply the same polynomial operator
+        tree to inputs from the same source — the symbolic stack.
+        """
+        return ff_symbolic.evaluate_program(prog)
 
 
 # ─── PyTorch Executor ────────────────────────────────────────────
