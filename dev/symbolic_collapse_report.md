@@ -2,6 +2,13 @@
 
 _15 collapsed | 3 guarded | 4 unrolled | 0 loop-symbolic | 7 blocked-by-opcode (total 29)._
 
+**What the polynomial column means (issue #69 update).** For collapsed
+rows the polynomial column is the *structural* output of both the
+symbolic executor and the FF bilinear form on `forward_symbolic` — not
+just a numerical agreement. See
+[`ff_symbolic_equivalence.md`](ff_symbolic_equivalence.md) for the
+construction and the test-level proof over all 15 collapsed rows.
+
 **Reading the status columns.** _Collapsed_ rows are straight-line
 programs that reduce to a single polynomial (the issue-#65 claim).
 _Guarded_ rows contain finite conditionals (JZ/JNZ on symbolic
