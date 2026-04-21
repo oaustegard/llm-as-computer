@@ -235,6 +235,103 @@ class Poly:
         return out
 
 
+# ─── Sign-indicator form (issue #76) ──────────────────────────────
+#
+# Comparisons (EQ, NE, LT_S, GT_S, LE_S, GE_S, EQZ) are not polynomial
+# operations on integer values: they're piecewise — 1 when a relation
+# holds, 0 otherwise. Symbolically we carry the comparison forward as a
+# (poly, relation) pair via :class:`IndicatorPoly`. Truncation to {0, 1}
+# happens only at :meth:`IndicatorPoly.eval_at`, the boundary step —
+# matching the same "polynomial-ring inside, non-poly step at the edge"
+# pattern :class:`RationalPoly` and :class:`SymbolicRemainder` already use
+# for DIV_S / REM_S.
+#
+# Composition past one comparison (e.g. ADD on top of an IndicatorPoly)
+# is out of scope — the consuming opcode raises
+# :class:`SymbolicOpNotSupported`. The catalog rows this unblocks
+# (``compare_lt_s``, ``compare_eqz``, ``native_max``, ...) all either
+# halt on the indicator directly (collapse to a non-Poly top) or pass it
+# straight to a JZ/JNZ that the forking executor turns into a guarded
+# split. Either way, the indicator never has to compose with another
+# arithmetic op.
+
+# Relation codes — comparisons are uniformly ``poly REL 0``, where REL
+# is one of these six. EQZ folds into ``IndicatorPoly(va, REL_EQ)`` (the
+# unary case is a degenerate binary one). Binary comparisons reduce to
+# the relation on the difference ``vb - va`` so a single shared diff
+# matrix suffices on the FF side (see ``ff_symbolic.M_CMP``).
+REL_EQ = "EQ"
+REL_NE = "NE"
+REL_LT = "LT"
+REL_LE = "LE"
+REL_GT = "GT"
+REL_GE = "GE"
+_RELATIONS = (REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE)
+
+# Pretty-print symbols for guard / indicator repr.
+_REL_SYMBOL = {
+    REL_EQ: "==", REL_NE: "!=",
+    REL_LT: "<",  REL_LE: "<=",
+    REL_GT: ">",  REL_GE: ">=",
+}
+
+# Negation table — used when JZ/JNZ pops an IndicatorPoly: the "not
+# taken" branch carries the negated relation as its guard.
+_NEGATE_REL = {
+    REL_EQ: REL_NE, REL_NE: REL_EQ,
+    REL_LT: REL_GE, REL_GE: REL_LT,
+    REL_LE: REL_GT, REL_GT: REL_LE,
+}
+
+
+def _relation_holds(rel: str, value: Union[int, Fraction]) -> bool:
+    """Evaluate ``value REL 0`` for the given relation code."""
+    if rel == REL_EQ: return value == 0
+    if rel == REL_NE: return value != 0
+    if rel == REL_LT: return value <  0
+    if rel == REL_LE: return value <= 0
+    if rel == REL_GT: return value >  0
+    if rel == REL_GE: return value >= 0
+    raise ValueError(f"unknown relation {rel!r}")
+
+
+@dataclass(frozen=True)
+class IndicatorPoly:
+    """Sign indicator on a polynomial: ``1 if poly REL 0 else 0``.
+
+    Carries a comparison's symbolic result through the stack without
+    leaving the polynomial ring at the *expression* level — the gate
+    fires only at :meth:`eval_at`, mirroring the boundary-truncation
+    pattern :class:`RationalPoly` uses for DIV_S. The wrapped ``poly``
+    is the (vb − va) difference for binary comparisons or the unary
+    operand directly for EQZ; ``relation`` is one of
+    ``REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE``.
+
+    Composition past an :class:`IndicatorPoly` (e.g. another ADD) is
+    out of scope for issue #76 — the consuming op raises
+    :class:`SymbolicOpNotSupported`, matching the rational story.
+    """
+    poly: Poly
+    relation: str
+
+    def __post_init__(self):
+        if self.relation not in _RELATIONS:
+            raise ValueError(
+                f"IndicatorPoly.relation must be one of {_RELATIONS}, "
+                f"got {self.relation!r}"
+            )
+
+    def variables(self) -> List[int]:
+        return self.poly.variables()
+
+    def eval_at(self, bindings: Mapping[int, int]) -> int:
+        v = self.poly.eval_at(bindings)
+        return 1 if _relation_holds(self.relation, v) else 0
+
+    def __repr__(self) -> str:
+        return f"[{self.poly} {_REL_SYMBOL[self.relation]} 0]"
+
+
 # ─── Rational + remainder forms (issue #75) ───────────────────────
 #
 # DIV_S / REM_S break out of the polynomial ring: integer division is
@@ -333,41 +430,83 @@ RationalStackValue = Union[Poly, RationalPoly, SymbolicRemainder]
 
 # ─── Guard + GuardedPoly ──────────────────────────────────────────
 #
-# A guard is a polynomial we assert is either "== 0" or "!= 0". A
-# conjunction is a tuple of guards that must all hold simultaneously.
-# GuardedPoly is a case table — one (conjunction, value_poly) entry per
-# partition of the input domain.
+# A guard is a polynomial we assert satisfies one of six relations vs
+# zero (``== / != / < / <= / > / >=``). A conjunction is a tuple of
+# guards that must all hold simultaneously. GuardedPoly is a case
+# table — one (conjunction, value_poly) entry per partition of the
+# input domain.
 #
-# Guards are value-compared on (poly, eq_zero), so two paths that derive
-# the same guard chain in different orders merge cleanly after sorting.
+# Guards are value-compared on (poly, relation), so two paths that
+# derive the same guard chain in different orders merge cleanly after
+# sorting. Issue #76 broadened the relation field from a binary
+# ``eq_zero`` flag to the full six-relation set so that JZ/JNZ on an
+# :class:`IndicatorPoly` cond produces guards that carry the comparison's
+# semantics — not just an "== 0 / != 0" approximation. The
+# :attr:`Guard.eq_zero` property survives as backwards-compat shorthand.
 
 
 @dataclass(frozen=True)
 class Guard:
-    """Assertion that ``poly == 0`` (eq_zero=True) or ``poly != 0``."""
+    """Assertion ``poly REL 0`` for one of the six standard relations.
+
+    ``relation`` is one of ``REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT,
+    REL_GE``. Pre-issue-#76 code only spoke of ``eq_zero=True/False``;
+    that's preserved as a derived property for the dedup-by-(poly,
+    eq_zero) call sites that have not been migrated. New code should
+    construct guards via the relation directly.
+    """
     poly: Poly
-    eq_zero: bool
+    relation: str
+
+    def __post_init__(self):
+        if self.relation not in _RELATIONS:
+            raise ValueError(
+                f"Guard.relation must be one of {_RELATIONS}, "
+                f"got {self.relation!r}"
+            )
+
+    @property
+    def eq_zero(self) -> bool:
+        """Backwards-compat shim — True iff this guard asserts ``poly == 0``.
+
+        Pre-#76 ``Guard`` only had ``eq_zero`` (True/False). The
+        property keeps that read-side API working for the
+        equality/inequality-only callers that haven't migrated to the
+        full relation enum. Comparison-derived guards (``LT/LE/GT/GE``)
+        return ``False`` here, since they don't assert equality with
+        zero — callers that need to distinguish them should switch to
+        ``g.relation``.
+        """
+        return self.relation == REL_EQ
+
+    def holds_at(self, bindings: Mapping[int, int]) -> bool:
+        """True iff ``poly REL 0`` holds at the given bindings."""
+        return _relation_holds(self.relation, self.poly.eval_at(bindings))
 
     def __repr__(self) -> str:
-        op = "==" if self.eq_zero else "!="
-        return f"({self.poly} {op} 0)"
+        return f"({self.poly} {_REL_SYMBOL[self.relation]} 0)"
 
 
 def _canonical_guards(guards: Tuple[Guard, ...]) -> Tuple[Guard, ...]:
     """Deduplicate + sort a guard conjunction for value-based equality."""
     # Use hash-based dedupe; Guard is frozen so hashable.
-    return tuple(sorted(set(guards), key=lambda g: (repr(g.poly), g.eq_zero)))
+    return tuple(sorted(set(guards), key=lambda g: (repr(g.poly), g.relation)))
 
 
 def _guards_complementary(a: Tuple[Guard, ...], b: Tuple[Guard, ...]) -> bool:
-    """True iff a and b differ on exactly one guard by `eq_zero` flip."""
+    """True iff a and b differ on exactly one guard by relation negation.
+
+    Two relations are complementary if one is the other's :data:`_NEGATE_REL`
+    image — i.e. ``EQ↔NE``, ``LT↔GE``, ``LE↔GT``. Used by callers that
+    want to detect "these two cases together cover the full domain" merges.
+    """
     if len(a) != len(b):
         return False
     diff = 0
     for ga, gb in zip(a, b):
         if ga == gb:
             continue
-        if ga.poly == gb.poly and ga.eq_zero != gb.eq_zero:
+        if ga.poly == gb.poly and _NEGATE_REL[ga.relation] == gb.relation:
             diff += 1
         else:
             return False
