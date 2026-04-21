@@ -1,6 +1,6 @@
 # FF symbolic equivalence — the weights ARE the polynomial
 
-_Issue #69 writeup. Follow-up to #65 (PR #66 symbolic executor, PR #67 catalog runner). Extended by #75 to cover DIV_S / REM_S via rational-pair algebra._
+_Issue #69 writeup. Follow-up to #65 (PR #66 symbolic executor, PR #67 catalog runner). Extended by #75 to cover DIV_S / REM_S via rational-pair algebra, and by #76 to cover comparisons (EQZ / EQ / NE / LT_S / GT_S / LE_S / GE_S) via gated bilinear forms with an `IndicatorPoly` sibling type._
 
 ## The claim, in one sentence
 
@@ -205,6 +205,189 @@ Two programs move from `blocked_opcode` to `collapsed`:
 because the single `eml(x, y) = exp(x) − ln(y)` operator has no
 division primitive.
 
+## Gated bilinear extension (issue #76)
+
+Comparisons (`EQZ`, `EQ`, `NE`, `LT_S`, `GT_S`, `LE_S`, `GE_S`) aren't
+polynomial operations over ℤ either — their outputs (0 or 1) depend on
+the **sign** of the input, not its algebraic structure. Issue #76
+carries the same idea that #75 used for rational ops into the
+comparison fragment:
+
+> Keep the polynomial fragment linear. Push the non-polynomial gate to
+> the boundary. Make the gate first-class rather than pretending it
+> isn't there.
+
+### The three moves
+
+1. **Symbolic executor: a new sibling type `IndicatorPoly`.**
+
+   ```python
+   @dataclass(frozen=True)
+   class IndicatorPoly:
+       poly: Poly        # the linear diff (pb − pa for binary cmps, pa for EQZ)
+       relation: str     # one of REL_EQ / REL_NE / REL_LT / REL_LE / REL_GT / REL_GE
+       def eval_at(self, bindings) -> int:
+           return int(_relation_holds(self.relation, self.poly.eval_at(bindings)))
+   ```
+
+   The polynomial stays pure (a linear diff). The gate lives in
+   `eval_at`. This is the **exact analogue of `RationalPoly`**: the
+   underlying `Poly` arithmetic is closed, the non-polynomial boundary
+   step (`_trunc_div` for rationals, `_relation_holds` for indicators)
+   fires only when a concrete integer is demanded.
+
+2. **`Guard` broadens from `eq_zero: bool` to `relation: str`.**
+
+   Pre-#76, a `Guard` meant "this polynomial equals zero" or "this
+   polynomial is nonzero" — the only relations JZ/JNZ branching
+   produced. Post-#76, a `Guard` carries any of the six relations.
+   `eq_zero` survives as a `@property` shim so existing code continues
+   to read the old semantics, but the canonical field is `relation`.
+
+   This lets JZ/JNZ consume an `IndicatorPoly` directly. Rather than
+   wrapping the indicator in an extra case-split, the executor **hoists**
+   the indicator's relation into the Guard pair:
+
+   ```python
+   # JZ on IndicatorPoly(poly=p, relation=LT) produces:
+   #   take_guard  (condition was 0 ⇒ ¬(p < 0))  : Guard(poly=p, relation=GE)
+   #   skip_guard  (condition was 1 ⇒ p < 0)     : Guard(poly=p, relation=LT)
+   ```
+
+   The `native_max` program — `GT_S; JZ skip; POP; HALT; skip: SWAP POP HALT` —
+   now collapses to a clean two-case `GuardedPoly`:
+
+   ```
+   Guarded[
+     {(x0 - x1 <= 0)} → x1,   # GT_S returned 0 ⇒ vb ≤ va ⇒ max is va = x1
+     {(x0 - x1 >  0)} → x0,   # GT_S returned 1 ⇒ vb > va ⇒ max is vb = x0
+   ]
+   ```
+
+   Note the guards carry `LE` / `GT` directly — not `EQ` / `NE` with
+   the indicator wrapped inside. The sign test the comparison opcode
+   implies is now the Guard's own relation.
+
+3. **`ff_symbolic`: two new linear matrices plus a relation gate.**
+
+   Comparisons decompose into **linear diff extraction** followed by a
+   **non-polynomial relation gate**:
+
+   | Op       | Weight tensor                                   | Shape        | Non-zero entries | Gate                  |
+   | -------- | ----------------------------------------------- | ------------ | ---------------: | --------------------- |
+   | Binary cmp | `M_CMP[0, DIM_VALUE] = -1`, `M_CMP[0, d+DIM_VALUE] = 1` | `(1, 2d)` | 2                | `1 if diff <rel> 0 else 0` |
+   | `EQZ`      | `M_EQZ[0, DIM_VALUE] = 1`                             | `(1, d)`   | 1                | `1 if va == 0 else 0` |
+
+   `forward_cmp(ea, eb, op)` computes `diff = M_CMP @ stack(ea, eb)`
+   (a scalar `vb − va`) then returns `E(_relation_holds(op_rel, diff))`.
+   `forward_eqz(ea)` is the `d`-wide variant for the unary case.
+
+   On the symbolic side, `symbolic_cmp(pa, pb, op)` returns
+   `IndicatorPoly(poly=pb - pa, relation=OP_RELATION[op])`; `symbolic_eqz(pa)`
+   returns `IndicatorPoly(poly=pa, relation=REL_EQ)`. The weight tensor's
+   polynomial interpretation is exactly this diff-extraction.
+
+   Total new non-zero weight budget: **3** (two for `M_CMP`, one for
+   `M_EQZ`). Running total after #69 + #75 + #76 is **12** non-zero
+   entries across seven matrices — the comparison fragment is cheaper
+   per-op than ADD/SUB because it only extracts a scalar, not a vector.
+
+### Equivalence theorem for the comparison fragment
+
+> For every comparison opcode `op ∈ {EQZ, EQ, NE, LT_S, GT_S, LE_S, GE_S}`
+> and every input embedding `ea, eb`:
+>
+> 1. **Structural.** `run_symbolic(P).top == forward_symbolic(P).top` on
+>    `IndicatorPoly` value-equality (same underlying `Poly`, same
+>    `relation` tag) for every program `P` ending on `op`.
+> 2. **Numeric (three-way).** `run_symbolic(P).top.eval_at(bindings) ==
+>    NumPyExecutor(P).top == TorchExecutor(P).top` for every `P` and
+>    every concrete bindings — the same agreement the `{ADD, SUB, MUL}`
+>    and `{DIV_S, REM_S}` fragments enjoy, now extended over the six
+>    signed comparison opcodes plus `EQZ`.
+> 3. **Dispatch.** If `op` is immediately consumed by `JZ` / `JNZ`, the
+>    resulting `GuardedPoly` has guards whose `relation` reflects the
+>    taken / skipped interpretation of the comparison, not a two-level
+>    `indicator == 0` / `indicator != 0` wrapping.
+
+Point (3) is the cosmetic-but-important payoff: the `GuardedPoly` for
+`native_max(a, b)` reads as *"if a ≤ b then b else a"* at the case-table
+level, without the reader having to unfold an intermediate indicator.
+
+### Catalog impact
+
+Two straight-line rows move from `blocked_opcode` to `collapsed`
+(`IndicatorPoly` tops):
+- `compare_lt_s(3, 5)` → `[x0 - x1 < 0]`, numeric = 1.
+- `compare_eqz(0)`    → `[x0 == 0]`, numeric = 1.
+
+One row moves from `blocked_opcode` to `collapsed_guarded`:
+- `native_max(3, 5)` → `Guarded[{x0 - x1 ≤ 0} → x1; {x0 - x1 > 0} → x0]`,
+  numeric = 5.
+
+eml-sr columns stay `–` for indicator rows — the single-operator family
+`eml(x, y) = exp(x) − ln(y)` has no sign primitive. The gate lives at
+the FF-dispatch boundary, not inside the polynomial the eml tree would
+compile. That's the same reason `is_rational` rows skip eml: the
+polynomial part of the tree is perfectly expressible, but the wrapping
+semantics aren't.
+
+### Composition non-goal
+
+Arithmetic composed on top of an `IndicatorPoly` (e.g. `LT_S` followed by
+`ADD`) raises `SymbolicOpNotSupported` / `BlockedOpcodeForSymbolic`,
+mirroring the rational-composition non-goal from #75. Supporting it
+would require either (a) promoting `IndicatorPoly` to a first-class
+piecewise polynomial algebra, or (b) materialising the 0/1 value
+eagerly — either of which defeats the "keep the polynomial fragment
+linear" principle. Out of scope for this issue.
+
+### Refactor plan: migrating S1 guards to sign indicators
+
+S1 (PR #71 / issue #70) introduced the forking executor with
+`Guard(poly, eq_zero=bool)`. Post-#76, `Guard.eq_zero` is a `@property`
+shim over the canonical `relation` field, but the *shape* of what
+guards can express is now strictly larger than it was in S1:
+
+- S1 guards only ever carried `REL_EQ` or `REL_NE` (the only relations
+  JZ/JNZ against a plain `Poly` could produce).
+- Post-#76 guards can carry any of six relations, because JZ/JNZ
+  consuming an `IndicatorPoly` *hoists* that indicator's relation
+  directly into the Guard.
+
+The S1 refactor to lean on sign indicators is already mostly done —
+this PR changed `Guard.relation` in place rather than keeping a parallel
+field. What still has pre-#76 phrasing and would be cosmetically nicer
+as signs:
+
+1. **`_as_concrete_int` collapses concrete `IndicatorPoly`** values to
+   0/1 at JZ/JNZ time. If a program happens to supply concrete pushes
+   all the way into a comparison, the stack entry is already a plain
+   `int` by the time `JZ` runs — the IndicatorPoly gets evaluated
+   eagerly. This keeps concrete-mode traces matching pre-#76 behavior.
+   No change needed; noted for readers.
+
+2. **S1 catalog rows (`select_by_sign`, `clamp_zero`, `either_or`)**
+   still render with `EQ/NE` guards in their `case_exprs`. That's
+   correct — these programs use plain JZ on a raw `Poly` (not an
+   `IndicatorPoly`), so the guard relations really *are* equality vs
+   inequality. The broader relation set only kicks in when a comparison
+   op feeds JZ/JNZ.
+
+3. **Follow-up opportunity.** The sign-indicator framework makes it
+   possible to *canonicalise* guards during `GuardedPoly` merges: two
+   cases whose guards are `{p < 0}` and `{p > 0}` could be proven
+   disjoint-but-not-covering (missing `p == 0`). Today the executor
+   doesn't do this reasoning. A future issue could add a guard
+   simplifier / coverage checker that uses the six-relation algebra
+   to detect redundant or missing cases. Not in this PR.
+
+The net effect: the S1 guard layer is now strictly richer, with no
+behavioral drift on pre-#76 rows (verified: `test_classify_guarded_on_symbolic_branch`
+and the `select_by_sign` / `clamp_zero` / `either_or` catalog pins
+still pass exactly, including the `{g.eq_zero for ...} == {True, False}`
+assertion that reads guards via the backward-compat property).
+
 ## Honest limits
 
 ### Range / i32-wrap
@@ -240,8 +423,12 @@ Listing these explicitly so the PR description stays honest:
   boundary trunc), but composition *past* a rational stack entry
   still raises. Full rational-function algebra (with GCD cancellation)
   is a follow-up.
-- **Comparisons** (EQ, LT_S, GT_S, …) — piecewise, need sign indicators
-  and/or Heaviside gating; out of scope.
+- **Comparisons** (EQ, LT_S, GT_S, …) — handled by issue #76 via
+  gated bilinear forms (linear diff extraction + relation gate at the
+  dispatch boundary). See the "Gated bilinear extension" section above.
+  Composition **past** a comparison (arithmetic on an `IndicatorPoly`)
+  is still out of scope; `IndicatorPoly` is a terminal wrapper like
+  `RationalPoly`.
 - **Bitwise** (AND, OR, XOR, shifts, rotates) — different algebra (mod-2
   bilinear forms over bit decompositions); out of scope.
 - **Unary ops** (CLZ, CTZ, POPCNT, ABS, NEG) — some are polynomial
@@ -299,9 +486,10 @@ Each of these is a separate issue:
   REM_S applied to an already-rational stack entry is the next bite.
   Needs GCD-based cancellation in the `Poly` ring (or a `RationalPoly`
   type with an explicit normal form).
-- **Piecewise bilinear forms** for comparisons. A sign-indicator
-  attention pattern gates into one of two output branches — the FF
-  counterpart of the symbolic executor's forking model (#70).
+- ~~**Piecewise bilinear forms** for comparisons.~~ **Done in #76.**
+  `IndicatorPoly` + gated bilinear forms (`M_CMP` / `M_EQZ` + relation
+  gate) realise the six signed comparisons + `EQZ`, and JZ/JNZ
+  consuming an indicator hoists its relation into the Guard pair.
 - **Mod-2 bilinear forms** for bitwise ops via bit decomposition. Same
   FF-layer machinery, different base ring.
 
@@ -310,7 +498,7 @@ visible.
 
 ## References
 
-- Parent issue: #65 · follow-ups: #69, #75
+- Parent issue: #65 · follow-ups: #69, #75, #76
 - Symbolic executor: PR #66
 - Catalog runner + eml bridge: PR #67
 - Forking / guarded execution: PR #71 (issue #70)
@@ -321,3 +509,10 @@ visible.
   `symbolic_div_s` / `symbolic_rem_s` to `ff_symbolic.py`, rational
   rows to `symbolic_programs_catalog.py`, and the rational section
   above to this writeup.
+- Comparison extension (gated bilinear forms): issue #76 — adds
+  `IndicatorPoly` sibling type and the six-relation `Guard` to
+  `symbolic_executor.py`, `M_CMP` / `M_EQZ` + `forward_cmp` /
+  `forward_eqz` + `symbolic_cmp` / `symbolic_eqz` to `ff_symbolic.py`,
+  indicator rows to `symbolic_programs_catalog.py`, and the "Gated
+  bilinear extension" + "Refactor plan" sections above to this
+  writeup.
