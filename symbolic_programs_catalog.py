@@ -39,11 +39,14 @@ from symbolic_executor import (
     ForkingResult,
     Guard,
     GuardedPoly,
+    IndicatorPoly,
     Poly,
     RationalPoly,
     SymbolicOpNotSupported,
     SymbolicRemainder,
     SymbolicStackUnderflow,
+    _REL_SYMBOL,
+    _relation_holds,
     run_forking,
     run_symbolic,
 )
@@ -104,6 +107,10 @@ _POLY_OPS = {
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
+    # Comparisons (issue #76) — collapse to IndicatorPoly tops and
+    # hoist relations into Guards when consumed by JZ/JNZ.
+    isa.OP_EQZ, isa.OP_EQ, isa.OP_NE,
+    isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
 }
 # Control flow — handled by the forking executor (issue #70).
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
@@ -130,6 +137,10 @@ class ClassificationResult:
     # Rational tops (issue #75) — present when the program ends on a single
     # DIV_S (RationalPoly) or REM_S (SymbolicRemainder).
     rational: Optional[Any] = None        # Union[RationalPoly, SymbolicRemainder]
+    # Indicator tops (issue #76) — present when the program ends on a
+    # comparison (EQZ/EQ/NE/LT_S/LE_S/GT_S/GE_S) with an unconsumed
+    # IndicatorPoly on top of the stack.
+    indicator: Optional[IndicatorPoly] = None
     n_heads: int = 0
     bindings: Dict[int, int] = field(default_factory=dict)
     n_cases: int = 0                       # number of cases in guarded output
@@ -176,6 +187,11 @@ def classify_program(prog) -> ClassificationResult:
         return ClassificationResult(status=STATUS_BLOCKED_UNDERFLOW)
 
     if r_sym.status == "straight":
+        if isinstance(r_sym.top, IndicatorPoly):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED, indicator=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
         if isinstance(r_sym.top, (RationalPoly, SymbolicRemainder)):
             return ClassificationResult(
                 status=STATUS_COLLAPSED, rational=r_sym.top,
@@ -301,9 +317,16 @@ def _default_catalog() -> List[CatalogEntry]:
     entries.append(CatalogEntry("native_clz(16)",       *P.make_native_clz(16)))
     entries.append(CatalogEntry("native_abs_unary(-3)", *P.make_native_abs_unary(-3)))
     entries.append(CatalogEntry("native_neg(5)",        *P.make_native_neg(5)))
+    # Comparisons (issue #76) — collapse to IndicatorPoly tops under
+    # the gated-bilinear-form treatment. These rows used to land in
+    # ``blocked_opcode``; after M2 they classify as ``collapsed``.
     entries.append(CatalogEntry(
         "compare_lt_s(3,5)",
         *P.make_compare_binary(isa.OP_LT_S, 3, 5),
+    ))
+    entries.append(CatalogEntry(
+        "compare_eqz(0)",
+        *P.make_compare_eqz(0),
     ))
     entries.append(CatalogEntry(
         "bitwise_and(12,10)",
@@ -321,7 +344,9 @@ def _default_catalog() -> List[CatalogEntry]:
     entries.append(CatalogEntry("clamp_zero(5)",     *P.make_clamp_zero(5)))
     entries.append(CatalogEntry("either_or(3,7,1)",  *P.make_either_or(3, 7, 1)))
 
-    # Still blocked — non-polynomial op.
+    # Guarded comparison + dispatch (issue #76) — GT_S followed by JZ
+    # hoists the comparison's relation into the Guard pair, producing
+    # a two-case GuardedPoly rather than blocking on the opcode.
     entries.append(CatalogEntry("native_max(3,5)", *P.make_native_max(3, 5)))
 
     return entries
@@ -369,6 +394,12 @@ class CatalogRow:
     # n_monomials fields stay ``None`` for these rows since eml-sr has no
     # division primitive; ``poly_expr`` renders the rational form.
     is_rational: bool = False
+    # Indicator top flag (issue #76) — True for programs that collapse
+    # to an IndicatorPoly (gated bilinear form: linear diff + relation
+    # gate). eml_* columns stay ``None`` since the single-operator EML
+    # family has no sign primitive; the gate lives at the FF-dispatch
+    # boundary rather than inside the polynomial.
+    is_indicator: bool = False
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -380,9 +411,9 @@ def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
 
 
 def _guard_to_expr(guard: Guard) -> str:
-    """Human-readable rendering of a single Guard (poly op 0)."""
-    op = "== 0" if guard.eq_zero else "!= 0"
-    return f"{poly_to_expr(guard.poly)} {op}"
+    """Human-readable rendering of a single Guard (poly relation 0)."""
+    sym = _REL_SYMBOL[guard.relation]
+    return f"{poly_to_expr(guard.poly)} {sym} 0"
 
 
 def _guards_to_expr(guards) -> str:
@@ -439,7 +470,9 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         row.numpy_top = _numpy_top(np_exec, entry.prog)
 
         if cr.status == STATUS_COLLAPSED or cr.status == STATUS_COLLAPSED_UNROLLED:
-            if cr.rational is not None:
+            if cr.indicator is not None:
+                _fill_indicator_row(row, cr.indicator, cr.bindings, row.numpy_top)
+            elif cr.rational is not None:
                 _fill_rational_row(row, cr.rational, cr.bindings, row.numpy_top)
             elif cr.poly is not None:
                 _fill_poly_row(row, cr.poly, cr.bindings, row.numpy_top)
@@ -497,6 +530,38 @@ def _fill_rational_row(row: CatalogRow, rational,
     try:
         sym_val = rational.eval_at(bindings) if bindings else rational.eval_at({})
     except (KeyError, ValueError, ZeroDivisionError):
+        sym_val = None
+
+    if sym_val is None or numpy_top is None:
+        row.numeric_match = None
+    else:
+        row.numeric_match = (sym_val == numpy_top)
+
+
+def _fill_indicator_row(row: CatalogRow, indicator: IndicatorPoly,
+                        bindings: Dict[int, int],
+                        numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from an IndicatorPoly top (issue #76).
+
+    ``indicator`` is a gated bilinear form: a linear ``Poly`` diff
+    (``vb - va`` for binary comparisons, the value itself for EQZ) plus a
+    relation tag. Renders as ``[poly <rel> 0]`` and evaluates via
+    ``indicator.eval_at`` so the non-polynomial gate lands at the
+    boundary. eml-sr columns stay ``None`` — the single-operator family
+    has no sign primitive; the gate lives in the FF dispatch, not the
+    polynomial algebra.
+
+    ``n_monomials`` reports the term count of the underlying linear
+    diff polynomial — a meaningful complexity proxy even without a
+    value-EML tree. ``poly_expr`` carries the full bracketed indicator.
+    """
+    row.is_indicator = True
+    row.poly_expr = repr(indicator)
+    row.n_monomials = indicator.poly.n_monomials()
+
+    try:
+        sym_val = indicator.eval_at(bindings) if bindings else indicator.eval_at({})
+    except KeyError:
         sym_val = None
 
     if sym_val is None or numpy_top is None:
@@ -582,9 +647,7 @@ def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
         ok = True
         for g in gs:
             gv = _eval_poly_safe(g.poly, bindings)
-            if g.eq_zero and gv != 0:
-                ok = False; break
-            if not g.eq_zero and gv == 0:
+            if not _relation_holds(g.relation, gv):
                 ok = False; break
         if not ok:
             continue
