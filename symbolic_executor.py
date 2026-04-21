@@ -28,8 +28,20 @@ Issue #70 extends the executor past straight-line code:
     path halts with ``loop_symbolic`` — we don't attempt invariant
     inference.
 
+Issue #75 lifts DIV_S / REM_S out of scope: they emit
+:class:`RationalPoly` / :class:`SymbolicRemainder` boundary types so the
+ring stays closed inside the executor and truncation lives at
+``eval_at``. Issue #76 does the same for the comparison opcodes (EQ,
+NE, LT_S, GT_S, LE_S, GE_S, EQZ): the result is an
+:class:`IndicatorPoly` carrying ``poly`` + ``relation``, evaluated to
+{0, 1} only at the boundary. JZ/JNZ on an :class:`IndicatorPoly` cond
+hoists the relation directly into the resulting :class:`Guard` so a
+``LT_S; JZ ...`` pair produces a ``GuardedPoly`` whose cases carry
+``<`` / ``>=`` semantics — not just ``== 0`` / ``!= 0``.
+
 Out of scope (file as follow-ups):
-  - Non-polynomial opcodes (DIV_S, REM_S, comparisons, bitwise).
+  - Bitwise opcodes (AND/OR/XOR/SHL/SHR_S/SHR_U/ROTL/ROTR).
+  - Composition past one DIV_S/REM_S/comparison (e.g. ``LT_S; ADD``).
   - Loop-invariant inference for truly symbolic loops.
   - Locals, heap, memory — no symbolic address model yet.
   - Emitting W_Q/W_K/W_V themselves as expression trees (the issue's
@@ -424,8 +436,10 @@ class SymbolicRemainder:
 
 
 # Union covering every "top of symbolic stack" type run_symbolic /
-# run_forking might emit for a branchless polynomial-plus-rational program.
-RationalStackValue = Union[Poly, RationalPoly, SymbolicRemainder]
+# run_forking might emit for a branchless polynomial-plus-rational-plus-
+# indicator program. Issue #76 added :class:`IndicatorPoly` to carry
+# comparison results (EQ/NE/LT_S/GT_S/LE_S/GE_S/EQZ) through the stack.
+RationalStackValue = Union[Poly, RationalPoly, SymbolicRemainder, IndicatorPoly]
 
 
 # ─── Guard + GuardedPoly ──────────────────────────────────────────
@@ -555,10 +569,7 @@ class GuardedPoly:
                 except KeyError:
                     ok = False
                     break
-                if g.eq_zero and val != 0:
-                    ok = False
-                    break
-                if not g.eq_zero and val == 0:
+                if not _relation_holds(g.relation, val):
                     ok = False
                     break
             if ok:
@@ -586,12 +597,35 @@ class GuardedPoly:
 # (outputs are :class:`RationalPoly` / :class:`SymbolicRemainder`) but
 # the executor still accepts them as long as nothing downstream tries to
 # compose a Poly op against a rational stack entry.
+# Issue #76 adds the comparisons (EQ / NE / LT_S / GT_S / LE_S / GE_S /
+# EQZ): they break the ring too, producing :class:`IndicatorPoly` tops.
+# Same composition rule applies — the consuming op must be HALT or
+# JZ/JNZ.
+_CMP_BIN_OPS = {
+    isa.OP_EQ, isa.OP_NE,
+    isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
+}
+_CMP_UNARY_OPS = {isa.OP_EQZ}
+_CMP_OPS = _CMP_BIN_OPS | _CMP_UNARY_OPS
+
+# Per-op (binary) relation when wrapping ``IndicatorPoly(a - b, REL)``,
+# where ``a = stack[SP-1]`` (the WASM ``vb``) and ``b = top`` (``va``).
+# This matches :file:`executor.py:230-245` ("``1 if vb < va else 0``" etc.).
+_BIN_OP_RELATION = {
+    isa.OP_EQ: REL_EQ,
+    isa.OP_NE: REL_NE,
+    isa.OP_LT_S: REL_LT,
+    isa.OP_GT_S: REL_GT,
+    isa.OP_LE_S: REL_LE,
+    isa.OP_GE_S: REL_GE,
+}
+
 _POLY_OPS = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
-}
+} | _CMP_OPS
 # Branch ops the forking executor additionally handles.
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
 # Union: what run_forking accepts.
@@ -666,12 +700,12 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
     issue-#65 "branchless only" contract. Use :func:`run_forking` for
     programs with JZ/JNZ.
     """
-    stack: List[Poly] = []
+    stack: List[RationalStackValue] = []
     bindings: Dict[int, int] = {}
     next_var = 0
     n_heads = 0
 
-    def _pop() -> Poly:
+    def _pop() -> RationalStackValue:
         if not stack:
             raise SymbolicStackUnderflow("pop from empty stack")
         return stack.pop()
@@ -744,6 +778,25 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
                     "(composition past one DIV_S/REM_S is a follow-up)"
                 )
             stack.append(SymbolicRemainder(num=a, denom=b))
+        elif op in _CMP_BIN_OPS:
+            b = _pop(); a = _pop()
+            if not isinstance(a, Poly) or not isinstance(b, Poly):
+                raise SymbolicOpNotSupported(
+                    f"{isa.OP_NAMES[op]} on non-Poly stack entries is out "
+                    "of scope (composition past one DIV_S/REM_S/comparison "
+                    "is a follow-up)"
+                )
+            # WASM convention: ``a = stack[SP-1]`` (vb), ``b = top`` (va).
+            # The relation table maps each op to ``vb REL va`` ⇔ ``a - b REL 0``.
+            stack.append(IndicatorPoly(poly=a - b, relation=_BIN_OP_RELATION[op]))
+        elif op == isa.OP_EQZ:
+            a = _pop()
+            if not isinstance(a, Poly):
+                raise SymbolicOpNotSupported(
+                    "EQZ on non-Poly stack entries is out of scope "
+                    "(composition past one DIV_S/REM_S/comparison is a follow-up)"
+                )
+            stack.append(IndicatorPoly(poly=a, relation=REL_EQ))
         elif op == isa.OP_SWAP:
             if len(stack) < 2:
                 raise SymbolicStackUnderflow("swap needs 2 entries")
@@ -784,6 +837,8 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
 ArithFn = Callable[["Poly", "Poly"], "Poly"]
 DivFn = Callable[["Poly", "Poly"], "RationalPoly"]
 RemFn = Callable[["Poly", "Poly"], "SymbolicRemainder"]
+CmpBinFn = Callable[["Poly", "Poly"], "IndicatorPoly"]
+CmpUnaryFn = Callable[["Poly"], "IndicatorPoly"]
 
 
 @dataclass(frozen=True)
@@ -800,12 +855,41 @@ class ArithmeticOps:
     ``i32.div_s`` / ``i32.rem_s`` semantics — ``a`` is stack[SP-1] (the
     dividend) and ``b`` is top (the divisor), matching the numeric
     path's ``_trunc_div(vb, va)`` convention (``executor.py:835-838``).
+
+    ``cmp_eq / cmp_ne / cmp_lt_s / cmp_gt_s / cmp_le_s / cmp_ge_s``
+    (issue #76) must return an :class:`IndicatorPoly` capturing
+    "``vb REL va`` ⇔ ``a - b REL 0``" under the same ``a = SP-1, b =
+    top`` convention. ``eqz(a)`` returns the unary "``a == 0``"
+    indicator. The ``cmp(op)`` helper resolves an opcode to the right
+    primitive — used by :func:`_apply_poly_op`.
     """
     add: ArithFn
     sub: ArithFn
     mul: ArithFn
     div_s: DivFn = None  # type: ignore[assignment]
     rem_s: RemFn = None  # type: ignore[assignment]
+    cmp_eq: CmpBinFn = None  # type: ignore[assignment]
+    cmp_ne: CmpBinFn = None  # type: ignore[assignment]
+    cmp_lt_s: CmpBinFn = None  # type: ignore[assignment]
+    cmp_gt_s: CmpBinFn = None  # type: ignore[assignment]
+    cmp_le_s: CmpBinFn = None  # type: ignore[assignment]
+    cmp_ge_s: CmpBinFn = None  # type: ignore[assignment]
+    eqz: CmpUnaryFn = None  # type: ignore[assignment]
+
+    def cmp(self, op: int) -> Optional[CmpBinFn]:
+        """Resolve an OP_* opcode to the matching binary-cmp primitive.
+
+        Returns ``None`` if the relevant field is not wired — caller
+        raises :class:`SymbolicOpNotSupported`.
+        """
+        return {
+            isa.OP_EQ: self.cmp_eq,
+            isa.OP_NE: self.cmp_ne,
+            isa.OP_LT_S: self.cmp_lt_s,
+            isa.OP_GT_S: self.cmp_gt_s,
+            isa.OP_LE_S: self.cmp_le_s,
+            isa.OP_GE_S: self.cmp_ge_s,
+        }.get(op)
 
 
 DEFAULT_ARITHMETIC_OPS = ArithmeticOps(
@@ -814,6 +898,13 @@ DEFAULT_ARITHMETIC_OPS = ArithmeticOps(
     mul=lambda a, b: a * b,
     div_s=lambda a, b: RationalPoly(num=a, denom=b),
     rem_s=lambda a, b: SymbolicRemainder(num=a, denom=b),
+    cmp_eq=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_EQ),
+    cmp_ne=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_NE),
+    cmp_lt_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_LT),
+    cmp_gt_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_GT),
+    cmp_le_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_LE),
+    cmp_ge_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_GE),
+    eqz=lambda a: IndicatorPoly(poly=a, relation=REL_EQ),
 )
 
 
@@ -833,7 +924,18 @@ def _as_concrete_int(p: "RationalStackValue") -> Optional[int]:
     subsequent JZ/JNZ is out of scope for issue #75, so return ``None``
     and let the caller fall into the symbolic-cond path (which will then
     raise when it tries to wrap the value in a Guard).
+
+    :class:`IndicatorPoly` *can* collapse: when its inner ``poly`` is
+    concrete, the indicator evaluates to 0 or 1 deterministically and
+    JZ/JNZ should follow the branch without forking. Issue #76 needs this
+    so ``compare_lt_s(3, 5)`` (concrete inputs) collapses straight to
+    ``1`` even when consumed by a later branch.
     """
+    if isinstance(p, IndicatorPoly):
+        inner = _as_concrete_int(p.poly)
+        if inner is None:
+            return None
+        return 1 if _relation_holds(p.relation, inner) else 0
     if not isinstance(p, Poly):
         return None
     if not p.terms:
@@ -904,7 +1006,48 @@ class ForkingResult:
 
 
 def _eq_guard(p: Poly, eq_zero: bool) -> Guard:
-    return Guard(poly=p, eq_zero=eq_zero)
+    """Backwards-compat shim: build an EQ/NE guard from a bool flag.
+
+    Pre-#76 callers built guards with ``eq_zero=True/False``. New code
+    should construct :class:`Guard` with the relation directly.
+    """
+    return Guard(poly=p, relation=REL_EQ if eq_zero else REL_NE)
+
+
+def _branch_guards(cond: "RationalStackValue", op: int) -> Tuple[Guard, Guard]:
+    """Build (take_guard, skip_guard) for a JZ/JNZ on a symbolic ``cond``.
+
+    For a plain :class:`Poly` cond, JZ takes when ``cond == 0`` (skip
+    when ``cond != 0``); JNZ flips. For an :class:`IndicatorPoly` cond
+    with ``(poly, R)``, "cond == 0" ⇔ "``poly`` does NOT satisfy R" ⇔
+    "``poly (negate R) 0``", so we hoist the comparison's polynomial
+    and relation into the guard rather than wrapping the indicator
+    inside one — that way the resulting :class:`GuardedPoly` carries
+    LT/LE/GT/GE guards directly and matches the semantics the catalog
+    needs to render with the right ``<``/``<=``/``>``/``>=`` symbols.
+
+    Raises :class:`SymbolicOpNotSupported` for cond types we can't gate
+    on (RationalPoly / SymbolicRemainder — DIV_S/REM_S past JZ/JNZ
+    isn't in scope yet).
+    """
+    if isinstance(cond, IndicatorPoly):
+        # cond == 0  ⇔  not (poly R 0)  ⇔  poly (negate R) 0
+        zero_relation = _NEGATE_REL[cond.relation]
+        nonzero_relation = cond.relation
+        zero_guard = Guard(poly=cond.poly, relation=zero_relation)
+        nonzero_guard = Guard(poly=cond.poly, relation=nonzero_relation)
+    elif isinstance(cond, Poly):
+        zero_guard = Guard(poly=cond, relation=REL_EQ)
+        nonzero_guard = Guard(poly=cond, relation=REL_NE)
+    else:
+        raise SymbolicOpNotSupported(
+            f"JZ/JNZ on a {type(cond).__name__} cond is out of scope; "
+            "branching past DIV_S/REM_S is a follow-up"
+        )
+    # JZ: take when cond == 0. JNZ: take when cond != 0.
+    if op == isa.OP_JZ:
+        return zero_guard, nonzero_guard
+    return nonzero_guard, zero_guard
 
 
 def run_forking(prog: List[isa.Instruction], *,
@@ -1049,11 +1192,10 @@ def run_forking(prog: List[isa.Instruction], *,
                     break
                 new_visited = path.visited_branches | {site}
 
-                eq_guard = _eq_guard(cond, eq_zero=True)
-                ne_guard = _eq_guard(cond, eq_zero=False)
-                # JZ: take when cond == 0. JNZ: take when cond != 0.
-                take_guard = eq_guard if op == isa.OP_JZ else ne_guard
-                skip_guard = ne_guard if op == isa.OP_JZ else eq_guard
+                # _branch_guards understands both bare-Poly and
+                # IndicatorPoly conds — for the latter it hoists the
+                # comparison's relation directly into the guards.
+                take_guard, skip_guard = _branch_guards(cond, op)
 
                 take_path = path.with_(
                     pc=target,
@@ -1213,6 +1355,32 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
                 "arithmetic_ops.rem_s is not wired; pass a rem_s primitive"
             )
         stack.append(arithmetic_ops.rem_s(a, b))
+    elif op in _CMP_BIN_OPS:
+        b = _pop(); a = _pop()
+        if not isinstance(a, Poly) or not isinstance(b, Poly):
+            raise SymbolicOpNotSupported(
+                f"{isa.OP_NAMES[op]} on non-Poly stack entries is out "
+                "of scope (composition past one DIV_S/REM_S/comparison "
+                "is a follow-up)"
+            )
+        cmp_fn = arithmetic_ops.cmp(op)
+        if cmp_fn is None:
+            raise SymbolicOpNotSupported(
+                f"arithmetic_ops.cmp({isa.OP_NAMES[op]}) is not wired"
+            )
+        stack.append(cmp_fn(a, b))
+    elif op == isa.OP_EQZ:
+        a = _pop()
+        if not isinstance(a, Poly):
+            raise SymbolicOpNotSupported(
+                "EQZ on non-Poly stack entries is out of scope "
+                "(composition past one DIV_S/REM_S/comparison is a follow-up)"
+            )
+        if arithmetic_ops.eqz is None:
+            raise SymbolicOpNotSupported(
+                "arithmetic_ops.eqz is not wired; pass an eqz primitive"
+            )
+        stack.append(arithmetic_ops.eqz(a))
     elif op == isa.OP_SWAP:
         if len(stack) < 2:
             raise SymbolicStackUnderflow(f"swap needs 2 entries at pc={path.pc}")
@@ -1281,6 +1449,9 @@ def collapse_report(prog: List[isa.Instruction], *,
 
 __all__ = [
     "Poly",
+    "RationalPoly",
+    "SymbolicRemainder",
+    "IndicatorPoly",
     "Guard",
     "GuardedPoly",
     "SymbolicResult",
@@ -1293,6 +1464,7 @@ __all__ = [
     "DEFAULT_ARITHMETIC_OPS",
     "DEFAULT_MAX_PATHS",
     "DEFAULT_MAX_STEPS",
+    "REL_EQ", "REL_NE", "REL_LT", "REL_LE", "REL_GT", "REL_GE",
     "run_symbolic",
     "run_forking",
     "collapse_report",
