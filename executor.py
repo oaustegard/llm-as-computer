@@ -837,18 +837,31 @@ class CompiledModel(nn.Module):
             nonlinear[OPCODE_IDX[OP_REM_S]] = float(_trunc_rem(vb, va) & MASK32)
             nonlinear[OPCODE_IDX[OP_REM_U]] = float(_trunc_rem(vb, va) & MASK32)
 
-        # Comparison ops
-        nonlinear[OPCODE_IDX[OP_EQZ]]  = 1.0 if va == 0 else 0.0
-        nonlinear[OPCODE_IDX[OP_EQ]]   = 1.0 if va == vb else 0.0
-        nonlinear[OPCODE_IDX[OP_NE]]   = 1.0 if va != vb else 0.0
-        nonlinear[OPCODE_IDX[OP_LT_S]] = 1.0 if vb < va else 0.0
-        nonlinear[OPCODE_IDX[OP_LT_U]] = 1.0 if vb < va else 0.0
-        nonlinear[OPCODE_IDX[OP_GT_S]] = 1.0 if vb > va else 0.0
-        nonlinear[OPCODE_IDX[OP_GT_U]] = 1.0 if vb > va else 0.0
-        nonlinear[OPCODE_IDX[OP_LE_S]] = 1.0 if vb <= va else 0.0
-        nonlinear[OPCODE_IDX[OP_LE_U]] = 1.0 if vb <= va else 0.0
-        nonlinear[OPCODE_IDX[OP_GE_S]] = 1.0 if vb >= va else 0.0
-        nonlinear[OPCODE_IDX[OP_GE_U]] = 1.0 if vb >= va else 0.0
+        # Comparison ops — the six signed binary cmps and EQZ route
+        # through ff_symbolic's gated bilinear forms (M_CMP / M_EQZ,
+        # issue #76) so the numeric path matches the polynomial spec
+        # used by the symbolic executor. Unsigned variants share the
+        # signed result since operands are already i32 here (positive
+        # or two's-complement-extended identically for == / != and
+        # treat-as-signed via Python int for </>/<=/>=).
+        nonlinear[OPCODE_IDX[OP_EQZ]]  = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_eqz(ea)))
+        nonlinear[OPCODE_IDX[OP_EQ]]   = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_EQ)))
+        nonlinear[OPCODE_IDX[OP_NE]]   = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_NE)))
+        nonlinear[OPCODE_IDX[OP_LT_S]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_LT_S)))
+        nonlinear[OPCODE_IDX[OP_LT_U]] = nonlinear[OPCODE_IDX[OP_LT_S]]
+        nonlinear[OPCODE_IDX[OP_GT_S]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_GT_S)))
+        nonlinear[OPCODE_IDX[OP_GT_U]] = nonlinear[OPCODE_IDX[OP_GT_S]]
+        nonlinear[OPCODE_IDX[OP_LE_S]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_LE_S)))
+        nonlinear[OPCODE_IDX[OP_LE_U]] = nonlinear[OPCODE_IDX[OP_LE_S]]
+        nonlinear[OPCODE_IDX[OP_GE_S]] = float(ff_symbolic.E_inv(
+            ff_symbolic.forward_cmp(ea, eb, OP_GE_S)))
+        nonlinear[OPCODE_IDX[OP_GE_U]] = nonlinear[OPCODE_IDX[OP_GE_S]]
 
         # Bitwise ops
         nonlinear[OPCODE_IDX[OP_AND]]   = float(_to_i32(va) & _to_i32(vb))
