@@ -395,7 +395,7 @@ assertion that reads guards via the backward-compat property).
 The bilinear form computes over `ℤ` — no `& MASK32`. The issue framed
 this as Option (a): "produce a polynomial over `ℤ`; add a `range_check`
 that asserts no wrap would have occurred on the catalog inputs." That's
-the route taken here.
+the route taken in #69 and it still holds.
 
 `CompiledModel.forward` still applies the mask *after* the bilinear form
 so that `NumPyExecutor` parity holds bit-for-bit (`test_consolidated.py`
@@ -410,9 +410,123 @@ however, is stated pre-mask:
 Every catalog program satisfies the range check; the largest unmasked
 value is `factorial(10) = 3,628,800`, well inside i32.
 
-Option (b) — carry `mod 2^32` through the polynomial algebra — is
-strictly heavier (polynomials over `ℤ/2^32ℤ` have gcd factoring issues
-and no division) and is deliberately out of scope.
+Issue #78 landed Option (b) as a sibling artefact — see the next
+section. Option (a) remains the "clean catalog" interpretation; Option
+(b) is the honest wrap theorem that also covers overflow-probing
+inputs.
+
+## Wrap-aware extension (issue #78 option (b))
+
+Issue #69 decided that carrying `mod 2³²` through the algebra was out
+of scope and pinned the range via :func:`ff_symbolic.range_check`
+instead (Option (a)). Issue #78's motivating concern is that the
+resulting theorem is *only* tested in the range where both sides agree,
+so "a bug in either direction would pass silently". Option (b) closes
+that gap — not by replacing Option (a), but by adding a sibling
+polynomial ring whose structural equality mirrors the FF layer's
+`& MASK32` step in the algebra itself.
+
+### `ModPoly`: polynomials over ℤ / 2³²
+
+`symbolic_executor.ModPoly` is a sibling of :class:`Poly`. Same canonical
+form (monomial dict, zero-coefficient terms dropped), same arithmetic
+surface (`+`, `-`, `*`, `__neg__`) — the one difference is that every
+operation reduces coefficients modulo 2³² via `__post_init__`. That
+reduction *is* the `& MASK32` step, now visible in one place instead of
+as a silent boundary fact.
+
+Key operations:
+
+```python
+ModPoly.from_poly(p)              # lift a pure-integer Poly
+mp1 + mp2, mp1 - mp2, mp1 * mp2   # closed under the ring ops
+mp.eval_at(bindings)              # unsigned u32 int in [0, 2³²)
+mp.eval_at_signed(bindings)       # signed i32 int in [-2³¹, 2³¹)
+```
+
+Non-goal: division. ℤ/2³² is a ring with zero divisors (`2 · 2³¹ = 0`),
+so no `a / b` is well-defined. That's fine — DIV_S / REM_S already live
+in their own wrapper (`RationalPoly` / `SymbolicRemainder`) whose
+boundary evaluator handles truncation and wrap together.
+
+### The mod-2³² driver
+
+`ff_symbolic.evaluate_program_mod(prog)` mirrors
+:func:`evaluate_program`, swapping `Poly` for `ModPoly` at every stack
+site. The arithmetic primitives are `symbolic_add_mod` / `_sub_mod` /
+`_mul_mod` — the ModPoly interpretation of the same operator tree
+`M_ADD` / `M_SUB` / `B_MUL` realise over floats.
+
+Scope is strictly narrower than :func:`evaluate_program`:
+`{ADD, SUB, MUL, PUSH, POP, DUP, NOP, SWAP, OVER, ROT, HALT}`.
+Comparisons, rationals, and bitwise ops raise
+`BlockedOpcodeForSymbolic` — those fragments have their own boundary
+wrap (`IndicatorPoly` / `RationalPoly` / `BitVec`) that already
+corresponds to the correct semantics; lifting them into ℤ/2³² would
+duplicate that logic.
+
+### Equivalence theorem (Option (b))
+
+> **Structural over ℤ/2³²:** For every collapsed catalog program P
+> whose `run_symbolic(P).top` is a plain `Poly`,
+>
+> ```python
+> ModPoly.from_poly(run_symbolic(P).top) == evaluate_program_mod(P).top
+> ```
+>
+> as dict-equality on canonical coefficient maps in [0, 2³²). 15/15
+> pure-Poly collapsed rows satisfy this
+> (`test_modpoly_catalog_structural`).
+
+The proof is a one-liner: the ring homomorphism ℤ → ℤ/2³² commutes
+with every primitive operation the two drivers apply, so lifting the
+inputs (each PUSH produces a ModPoly variable instead of a Poly
+variable) and doing the same operations produces the lifted result.
+`test_modpoly_homomorphism_on_catalog` asserts the commutation directly
+— `ModPoly.from_poly(evaluate_program.top) == evaluate_program_mod.top`.
+
+> **Numeric bit-for-bit:** For every collapsed row,
+>
+> ```python
+> evaluate_program_mod(P).top.eval_at(bindings) \
+>   == NumPyExecutor(P).top & 0xFFFFFFFF
+> ```
+>
+> No range check needed — the two sides agree in ℤ/2³² **by
+> construction**, not just on in-range inputs
+> (`test_modpoly_catalog_numeric`).
+
+### Overflow-stress coverage
+
+`test_modpoly_overflow_stress` exercises four programs where the ℤ
+result either doesn't fit signed i32 or exceeds `2³²` entirely:
+
+| Program                         | ℤ value          | ℤ/2³² value    | Native (NumPy) | Notes                                            |
+| ------------------------------- | ---------------: | -------------: | -------------: | ------------------------------------------------ |
+| `PUSH 46341; DUP; MUL`          |    2,147,488,281 |  2,147,488,281 |  2,147,488,281 | overflows signed i32 (I32_MAX = 2,147,483,647) |
+| `PUSH 100_000; PUSH 100_000; MUL` |  10,000,000,000 |  1,410,065,408 |  1,410,065,408 | exceeds u32; ℤ disagrees with native, ℤ/2³² matches |
+| `PUSH 65536; DUP; MUL`          |   4,294,967,296 |              0 |              0 | zero-divisor witness: `2¹⁶ · 2¹⁶ = 0 (mod 2³²)`  |
+| `PUSH I32_MAX; PUSH 2; ADD`     |    2,147,483,649 |  2,147,483,649 |  2,147,483,649 | signed overflow (reads as `I32_MIN + 1` signed)  |
+
+The 100k × 100k case is the one Option (a) could not cover: its
+`range_check` rejects the value (so the equivalence-under-range claim
+doesn't apply), but the program is still a valid catalog-style
+arithmetic trace. ModPoly makes the native-match provable for *any*
+i32-representable inputs, not just the ones that happen to stay below
+`I32_MAX`.
+
+### What Option (b) deliberately doesn't change
+
+- **Option (a) survives.** `range_check`, the equivalence theorem over
+  ℤ, the writeup above — all still accurate for the catalog. They're
+  the cleanest statement when inputs are known to be in range.
+- **`forward_symbolic` stays over ℤ.** The mod-2³² path is an
+  independent driver (`evaluate_program_mod`); the existing Poly-based
+  API is unchanged. No existing test regresses.
+- **Non-polynomial fragments stay in their wrappers.** Rationals,
+  indicators, bit-vectors already wrap correctly at their boundary
+  evaluators; lifting them into a ℤ/2³² polynomial would either
+  duplicate or contradict their semantics. Out of scope.
 
 ### What this issue does **not** prove
 
