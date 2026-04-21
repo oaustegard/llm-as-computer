@@ -112,13 +112,34 @@ relation field, that synthesis collapses to a straight pass-through.
 The catalog renderer (``symbolic_programs_catalog._guard_to_expr``)
 is the natural follow-up site to migrate.
 
+Bit-vector extension (issue #77)
+--------------------------------
+WASM ``i32.and`` / ``i32.or`` / ``i32.xor`` / ``i32.shl`` / ``i32.shr_s``
+/ ``i32.shr_u`` / ``i32.clz`` / ``i32.ctz`` / ``i32.popcnt`` are not
+polynomial over ℤ — AND/OR/XOR need (ℤ/2ℤ)[bits] to close, shifts are
+exponential in the shift amount, and the counter ops are piecewise.
+We model the family with the same "linear extractor + boundary
+nonlinearity" pattern DIV_S uses: ``M_BITBIN`` is a ``(2, 2*d_model)``
+pair-selector that plucks ``(va, vb)`` out of the stacked inputs,
+``M_BITUN`` is a ``(1, d_model)`` single-value extractor, and
+:func:`symbolic_executor._apply_bitop` is the boundary nonlinearity
+that applies the named op to the concrete integers.
+
+Symbolically the result carries as a :class:`BitVec` AST (issue #77)
+— the same "polynomial-ring inside, non-poly step at the edge"
+pattern :class:`RationalPoly` and :class:`IndicatorPoly` already use.
+Hybrid arithmetic (``SUB(31, CLZ(n))`` for log2_floor) lifts into the
+BitVec AST so the executor stays closed across one hybrid step; the
+catalog rows don't need anything deeper.
+
 Scope
 -----
 ADD/SUB/MUL via true (bi)linear forms; DIV_S/REM_S via pair-selector
 + boundary trunc (issue #75); comparisons via diff-extractor +
-relation gate (issue #76). Bitwise, unary numeric ops, control
-flow — all unchanged, and all explicit follow-ups per the issue's
-"Non-goals" section.
+relation gate (issue #76); bitwise family via pair / value selector
++ ``_apply_bitop`` boundary (issue #77). ROTL / ROTR, i64 variants,
+and ring-level simplification over (ℤ/2ℤ)[bits] are follow-ups per
+the issue's "Non-goals" section.
 """
 
 from __future__ import annotations
@@ -132,13 +153,16 @@ import isa
 from isa import DIM_VALUE, D_MODEL, DTYPE, _trunc_div, _trunc_rem
 from symbolic_executor import (
     ArithmeticOps,
+    BitVec,
     ForkingResult,
     IndicatorPoly,
     Poly,
     RationalPoly,
     RationalStackValue,
     REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE,
+    SymbolicIntAst,
     SymbolicRemainder,
+    _apply_bitop,
     _relation_holds,
     run_forking,
 )
@@ -310,6 +334,39 @@ def _M_EQZ_matrix(d_model: int = D_MODEL) -> torch.Tensor:
     return W
 
 
+def _M_BITBIN_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Pair-selector for binary bit ops (issue #77).
+
+    Shape: ``(2, 2*d_model)``. Row 0 picks ``va = ea[DIM_VALUE]`` (the
+    top — the shift amount for SHL/SHR, or one operand of AND/OR/XOR);
+    row 1 picks ``vb = eb[DIM_VALUE]`` (stack[SP-1] — the value being
+    shifted / the other operand). Shared across all six binary bit ops
+    (AND / OR / XOR / SHL / SHR_S / SHR_U); the per-op nonlinearity
+    fires at the boundary via :func:`symbolic_executor._apply_bitop`.
+
+    Same "linear extractor + boundary nonlinearity" shape as
+    ``M_DIV_S`` — the matrix alone doesn't realise the op, it exposes
+    that the FF receives exactly the two scalars it needs.
+    """
+    W = torch.zeros(2, 2 * d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = 1.0                       # va (top)
+    W[1, d_model + DIM_VALUE] = 1.0             # vb (SP-1)
+    return W
+
+
+def _M_BITUN_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Single-value extractor for unary bit ops (issue #77).
+
+    Shape: ``(1, d_model)``. Plucks ``va`` from ``E(a)`` so the
+    boundary nonlinearity (``_clz32`` / ``_ctz32`` / ``_popcnt32``) can
+    fire. Shared by CLZ / CTZ / POPCNT; same role as ``M_EQZ`` in the
+    comparison family.
+    """
+    W = torch.zeros(1, d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = 1.0
+    return W
+
+
 # Module-scope cached tensors — read-only; wrapped on access.
 M_ADD: torch.Tensor = _M_ADD_matrix()
 M_SUB: torch.Tensor = _M_SUB_matrix()
@@ -318,6 +375,8 @@ M_DIV_S: torch.Tensor = _M_DIV_S_matrix()
 M_REM_S: torch.Tensor = _M_REM_S_matrix()
 M_CMP: torch.Tensor = _M_CMP_matrix()
 M_EQZ: torch.Tensor = _M_EQZ_matrix()
+M_BITBIN: torch.Tensor = _M_BITBIN_matrix()
+M_BITUN: torch.Tensor = _M_BITUN_matrix()
 
 
 def n_parameters(d_model: int = D_MODEL) -> int:
@@ -332,13 +391,17 @@ def n_parameters(d_model: int = D_MODEL) -> int:
     * ``M_REM_S``   2 (pair-selector for ``(va, vb)``)
     * ``M_CMP``     2 (diff-extractor; shared by all six binary comparisons)
     * ``M_EQZ``     1 (single-value extractor)
+    * ``M_BITBIN``  2 (pair-selector; shared by AND/OR/XOR/SHL/SHR_S/SHR_U)
+    * ``M_BITUN``   1 (single-value extractor; shared by CLZ/CTZ/POPCNT)
 
-    Total: 12. The stored tensors are larger but the analytically-set
-    content is twelve bits. The six binary comparisons share ``M_CMP``
-    so their cost is the matrix entries plus six relation gates (the
-    gates are control-flow, not parameters).
+    Total: 15. The stored tensors are larger but the analytically-set
+    content is fifteen bits. Sharing matrices across families (six
+    comparisons behind ``M_CMP``, six binary bit ops behind ``M_BITBIN``,
+    three counter ops behind ``M_BITUN``) keeps the weight budget
+    proportional to the *number of operator families* the transformer
+    needs to route, not the number of opcodes.
     """
-    return 12
+    return 15
 
 
 # ─── Numeric primitives (float tensors) ───────────────────────────
@@ -464,6 +527,73 @@ def forward_eqz(ea: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# Map from binary bit opcode to the named op understood by
+# :func:`symbolic_executor._apply_bitop` and :class:`BitVec`.
+_BITBIN_OP_NAME = {
+    isa.OP_AND: "AND",
+    isa.OP_OR: "OR",
+    isa.OP_XOR: "XOR",
+    isa.OP_SHL: "SHL",
+    isa.OP_SHR_S: "SHR_S",
+    isa.OP_SHR_U: "SHR_U",
+}
+_BITUN_OP_NAME = {
+    isa.OP_CLZ: "CLZ",
+    isa.OP_CTZ: "CTZ",
+    isa.OP_POPCNT: "POPCNT",
+}
+
+
+def forward_bit_binary(ea: torch.Tensor, eb: torch.Tensor, op: int) -> torch.Tensor:
+    """Compute ``E(bit_binary(vb, va))`` from ``E(a), E(b)`` via ``M_BITBIN``.
+
+    ``op`` is one of ``OP_AND / OP_OR / OP_XOR / OP_SHL / OP_SHR_S / OP_SHR_U``.
+    The pair-selector extracts ``[va, vb] = M_BITBIN @ stacked`` (``va`` = top,
+    ``vb`` = SP-1) and then :func:`symbolic_executor._apply_bitop` applies the
+    named op with left=``vb``, right=``va`` (the "natural reading" convention
+    matching WASM: ``SHL(value, count) = value << count`` with value=SP-1,
+    count=top).
+
+    The output is re-embedded via ``E`` so the result shares the same
+    scalar-at-``DIM_VALUE`` layout as every other value in the model.
+    """
+    name = _BITBIN_OP_NAME.get(op)
+    if name is None:
+        raise ValueError(
+            f"forward_bit_binary: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"binary bit opcode (expected one of {sorted(_BITBIN_OP_NAME)})"
+        )
+    stacked = torch.cat([ea, eb])                       # shape (2*d_model,)
+    pair = M_BITBIN @ stacked                           # shape (2,): [va, vb]
+    va = int(round(float(pair[0].item())))
+    vb = int(round(float(pair[1].item())))
+    result = _apply_bitop(name, [vb, va])               # left=SP-1, right=top
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(result)
+    return out
+
+
+def forward_bit_unary(ea: torch.Tensor, op: int) -> torch.Tensor:
+    """Compute ``E(bit_unary(va))`` from ``E(a)`` via ``M_BITUN``.
+
+    ``op`` is one of ``OP_CLZ / OP_CTZ / OP_POPCNT``. The single-value
+    extractor plucks ``va = M_BITUN @ ea`` and then
+    :func:`symbolic_executor._apply_bitop` applies the named counter op.
+    Unary degenerate case of :func:`forward_bit_binary`.
+    """
+    name = _BITUN_OP_NAME.get(op)
+    if name is None:
+        raise ValueError(
+            f"forward_bit_unary: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"unary bit opcode (expected one of {sorted(_BITUN_OP_NAME)})"
+        )
+    va = int(round(float((M_BITUN @ ea).item())))
+    result = _apply_bitop(name, [va])
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(result)
+    return out
+
+
 # ─── Symbolic primitives (Poly values) ────────────────────────────
 #
 # These ARE polynomial algebra — ``Poly`` overloads ``+ - *`` — but they
@@ -540,6 +670,63 @@ def symbolic_eqz(pa: Poly) -> IndicatorPoly:
     return IndicatorPoly(poly=pa, relation=REL_EQ)
 
 
+def symbolic_bit_binary(pa: SymbolicIntAst, pb: SymbolicIntAst, op: int) -> BitVec:
+    """Symbolic binary bit op; corresponds to ``forward_bit_binary``.
+
+    Order matches ``forward_bit_binary`` (``pa`` is top, ``pb`` is
+    stack[SP-1]): returns ``BitVec(name, (pb, pa))`` — operands are
+    stored in the natural left-to-right reading order
+    ``(left=SP-1, right=top)``. The gate applies ``_apply_bitop(name,
+    [left, right])`` at :meth:`BitVec.eval_at`, same boundary-step
+    pattern :class:`RationalPoly` uses for DIV_S.
+
+    ``pa`` / ``pb`` may be :class:`Poly` or :class:`BitVec` — nested
+    bit programs (e.g. ``AND`` composed with a prior ``SHR_U``) land
+    here with a :class:`BitVec` on one or both sides.
+    """
+    name = _BITBIN_OP_NAME.get(op)
+    if name is None:
+        raise ValueError(
+            f"symbolic_bit_binary: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"binary bit opcode (expected one of {sorted(_BITBIN_OP_NAME)})"
+        )
+    return BitVec(op=name, operands=(pb, pa))
+
+
+def symbolic_bit_unary(pa: SymbolicIntAst, op: int) -> BitVec:
+    """Symbolic unary bit op; corresponds to ``forward_bit_unary``.
+
+    Returns ``BitVec(name, (pa,))``; the gate applies the named counter
+    op (``_clz32`` / ``_ctz32`` / ``_popcnt32``) at the boundary.
+    """
+    name = _BITUN_OP_NAME.get(op)
+    if name is None:
+        raise ValueError(
+            f"symbolic_bit_unary: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"unary bit opcode (expected one of {sorted(_BITUN_OP_NAME)})"
+        )
+    return BitVec(op=name, operands=(pa,))
+
+
+def symbolic_bit_arith(pa: SymbolicIntAst, pb: SymbolicIntAst, op: int) -> BitVec:
+    """Hybrid arithmetic lifted into :class:`BitVec` (issue #77).
+
+    Fires when :func:`symbolic_executor._apply_poly_op` sees ADD / SUB /
+    MUL with at least one :class:`BitVec` operand (log2_floor's
+    ``SUB(31, CLZ(n))`` case). Operand order matches
+    :func:`symbolic_bit_binary`: ``pa`` = top, ``pb`` = SP-1, stored
+    left-to-right in the BitVec AST as ``(pb, pa)`` so the expression
+    reads as "left OP right" = ``SP-1 OP top`` (matching WASM).
+    """
+    name = {isa.OP_ADD: "ADD", isa.OP_SUB: "SUB", isa.OP_MUL: "MUL"}.get(op)
+    if name is None:
+        raise ValueError(
+            f"symbolic_bit_arith: op {isa.OP_NAMES.get(op, op)!r} is not "
+            f"lifted-arithmetic (expected ADD/SUB/MUL)"
+        )
+    return BitVec(op=name, operands=(pb, pa))
+
+
 # Arithmetic primitives packaged for :func:`symbolic_executor.run_forking`'s
 # ``arithmetic_ops`` hook (issue #68 S3; extended for DIV_S/REM_S in #75;
 # extended for the comparison family in #76). The wrappers flip arg order
@@ -560,6 +747,26 @@ FF_ARITHMETIC_OPS = ArithmeticOps(
     cmp_le_s=lambda a, b: symbolic_cmp(b, a, isa.OP_LE_S),
     cmp_ge_s=lambda a, b: symbolic_cmp(b, a, isa.OP_GE_S),
     eqz=lambda a: symbolic_eqz(a),
+    # Bit-vector primitives (issue #77). Arg convention matches the
+    # rest: ``a`` = top, ``b`` = SP-1. ``symbolic_bit_*`` takes
+    # ``(pa, pb, op)`` in FF order (pa=top, pb=SP-1), so we pass
+    # ``(b, a)`` where relevant. Unary bit ops pass the single operand
+    # straight through.
+    bit_and=lambda a, b: symbolic_bit_binary(a, b, isa.OP_AND),
+    bit_or=lambda a, b: symbolic_bit_binary(a, b, isa.OP_OR),
+    bit_xor=lambda a, b: symbolic_bit_binary(a, b, isa.OP_XOR),
+    bit_shl=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHL),
+    bit_shr_s=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHR_S),
+    bit_shr_u=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHR_U),
+    bit_clz=lambda a: symbolic_bit_unary(a, isa.OP_CLZ),
+    bit_ctz=lambda a: symbolic_bit_unary(a, isa.OP_CTZ),
+    bit_popcnt=lambda a: symbolic_bit_unary(a, isa.OP_POPCNT),
+    # Hybrid arithmetic: at this callsite ``a`` = top, ``b`` = SP-1
+    # (mirroring how the Poly path calls ``sub(b, a)`` = ``b − a``).
+    # ``symbolic_bit_arith`` does the same swap internally.
+    bit_add=lambda a, b: symbolic_bit_arith(a, b, isa.OP_ADD),
+    bit_sub=lambda a, b: symbolic_bit_arith(a, b, isa.OP_SUB),
+    bit_mul=lambda a, b: symbolic_bit_arith(a, b, isa.OP_MUL),
 )
 
 
@@ -578,6 +785,10 @@ _SCOPE_OPS = {
     isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
     isa.OP_EQZ,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT,
+    # Issue #77 bit-vector fragment.
+    isa.OP_AND, isa.OP_OR, isa.OP_XOR,
+    isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U,
+    isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT,
 }
 
 
@@ -629,13 +840,26 @@ def evaluate_program(prog) -> SymbolicForwardResult:
             )
         return v
 
+    def _require_int_ast(v: RationalStackValue, op_name: str) -> SymbolicIntAst:
+        """Accept :class:`Poly` or :class:`BitVec` (the i32-valued AST types).
+
+        Used by bit ops and hybrid arithmetic: composition across the
+        BitVec boundary is in scope (``AND(SHR_U(k, n))``), but rational
+        / indicator operands still raise — those are follow-ups.
+        """
+        if not isinstance(v, (Poly, BitVec)):
+            raise BlockedOpcodeForSymbolic(
+                f"{op_name} on rational/indicator stack entries is out of scope"
+            )
+        return v
+
     for instr in prog:
         op = instr.op
         if op not in _SCOPE_OPS:
             raise BlockedOpcodeForSymbolic(
                 f"op {isa.OP_NAMES.get(op, f'?{op}')!r} is out of scope for the "
                 f"bilinear FF dispatch (ADD/SUB/MUL/DIV_S/REM_S + comparisons "
-                f"+ stack manip only)"
+                f"+ bit-vector fragment + stack manip only)"
             )
         if op == isa.OP_HALT:
             break
@@ -654,14 +878,29 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                 raise IndexError("dup on empty stack")
             stack.append(stack[-1])
         elif op == isa.OP_ADD:
-            b = _require_poly(_pop(), "ADD"); a = _require_poly(_pop(), "ADD")
-            stack.append(symbolic_add(a, b))
+            b = _pop(); a = _pop()
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                ai = _require_int_ast(a, "ADD"); bi = _require_int_ast(b, "ADD")
+                stack.append(symbolic_bit_arith(bi, ai, isa.OP_ADD))
+            else:
+                stack.append(symbolic_add(_require_poly(a, "ADD"),
+                                          _require_poly(b, "ADD")))
         elif op == isa.OP_SUB:
-            b = _require_poly(_pop(), "SUB"); a = _require_poly(_pop(), "SUB")
-            stack.append(symbolic_sub(a, b))
+            b = _pop(); a = _pop()
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                ai = _require_int_ast(a, "SUB"); bi = _require_int_ast(b, "SUB")
+                stack.append(symbolic_bit_arith(bi, ai, isa.OP_SUB))
+            else:
+                stack.append(symbolic_sub(_require_poly(a, "SUB"),
+                                          _require_poly(b, "SUB")))
         elif op == isa.OP_MUL:
-            b = _require_poly(_pop(), "MUL"); a = _require_poly(_pop(), "MUL")
-            stack.append(symbolic_mul(a, b))
+            b = _pop(); a = _pop()
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                ai = _require_int_ast(a, "MUL"); bi = _require_int_ast(b, "MUL")
+                stack.append(symbolic_bit_arith(bi, ai, isa.OP_MUL))
+            else:
+                stack.append(symbolic_mul(_require_poly(a, "MUL"),
+                                          _require_poly(b, "MUL")))
         elif op == isa.OP_DIV_S:
             b = _require_poly(_pop(), "DIV_S"); a = _require_poly(_pop(), "DIV_S")
             # forking executor convention: a = SP-1, b = top; result = a / b.
@@ -671,16 +910,39 @@ def evaluate_program(prog) -> SymbolicForwardResult:
             b = _require_poly(_pop(), "REM_S"); a = _require_poly(_pop(), "REM_S")
             stack.append(symbolic_rem_s(b, a))
         elif op in _OP_RELATION:
-            # Binary comparison (issue #76). Pop order / arg convention
-            # matches the arithmetic ops above: b = top, a = SP-1. The
-            # symbolic primitive takes (pa, pb) in FF order (pa=top,
-            # pb=SP-1), so we call symbolic_cmp(b, a, op).
+            # Binary comparison (issue #76) or BitVec-extended comparison (#77).
             name = isa.OP_NAMES.get(op, f"?{op}")
-            b = _require_poly(_pop(), name); a = _require_poly(_pop(), name)
-            stack.append(symbolic_cmp(b, a, op))
+            b = _pop(); a = _pop()
+            if isinstance(a, Poly) and isinstance(b, Poly):
+                stack.append(symbolic_cmp(b, a, op))
+            else:
+                ai = _require_int_ast(a, name); bi = _require_int_ast(b, name)
+                # is_power_of_2 composes POPCNT (BitVec) with PUSH 1 (Poly).
+                # Build the (vb − va) = (b − a) difference as a BitVec AST
+                # and wrap in IndicatorPoly; matches the poly path's semantics.
+                stack.append(IndicatorPoly(
+                    poly=BitVec(op="SUB", operands=(bi, ai)),
+                    relation=_OP_RELATION[op],
+                ))
         elif op == isa.OP_EQZ:
-            a = _require_poly(_pop(), "EQZ")
-            stack.append(symbolic_eqz(a))
+            a = _pop()
+            if isinstance(a, Poly):
+                stack.append(symbolic_eqz(a))
+            else:
+                ai = _require_int_ast(a, "EQZ")
+                stack.append(IndicatorPoly(poly=ai, relation=REL_EQ))
+        elif op in _BITBIN_OP_NAME:
+            # Binary bit op (issue #77). Same pop order as arithmetic:
+            # a = top, b = SP-1. ``symbolic_bit_binary`` takes (pa=top,
+            # pb=SP-1) and stores (left=SP-1, right=top) in the AST.
+            name = isa.OP_NAMES.get(op, f"?{op}")
+            b = _require_int_ast(_pop(), name)
+            a = _require_int_ast(_pop(), name)
+            stack.append(symbolic_bit_binary(a, b, op))
+        elif op in _BITUN_OP_NAME:
+            name = isa.OP_NAMES.get(op, f"?{op}")
+            a = _require_int_ast(_pop(), name)
+            stack.append(symbolic_bit_unary(a, op))
         elif op == isa.OP_SWAP:
             if len(stack) < 2:
                 raise IndexError("swap needs 2 entries")
@@ -732,13 +994,16 @@ __all__ = [
     "I32_MIN", "I32_MAX",
     "E", "E_inv",
     "M_ADD", "M_SUB", "B_MUL", "M_DIV_S", "M_REM_S", "M_CMP", "M_EQZ",
+    "M_BITBIN", "M_BITUN",
     "n_parameters",
     "forward_add", "forward_sub", "forward_mul",
     "forward_div_s", "forward_rem_s",
     "forward_cmp", "forward_eqz",
+    "forward_bit_binary", "forward_bit_unary",
     "symbolic_add", "symbolic_sub", "symbolic_mul",
     "symbolic_div_s", "symbolic_rem_s",
     "symbolic_cmp", "symbolic_eqz",
+    "symbolic_bit_binary", "symbolic_bit_unary", "symbolic_bit_arith",
     "FF_ARITHMETIC_OPS",
     "SymbolicForwardResult",
     "evaluate_program",
