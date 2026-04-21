@@ -141,14 +141,31 @@ def test_nop_preserves_stack():
 
 
 def test_unsupported_op_raises():
-    import pytest
-    prog = program(("PUSH", 2), ("PUSH", 3), ("DIV_S",), ("HALT",))
+    # AND remains outside _POLY_OPS (bitwise — not rational-algebraic).
+    # DIV_S / REM_S are in scope per issue #75.
+    prog = program(("PUSH", 12), ("PUSH", 10), ("AND",), ("HALT",))
     try:
         run_symbolic(prog)
     except SymbolicOpNotSupported as e:
-        assert "DIV_S" in str(e)
+        assert "AND" in str(e)
     else:
-        raise AssertionError("expected SymbolicOpNotSupported for DIV_S")
+        raise AssertionError("expected SymbolicOpNotSupported for AND")
+
+
+def test_div_s_composition_raises():
+    """DIV_S then ADD — arithmetic on a RationalPoly is out of scope (#75)."""
+    prog = program(
+        ("PUSH", 10), ("PUSH", 3), ("DIV_S",),
+        ("PUSH", 1), ("ADD",), ("HALT",),
+    )
+    try:
+        run_symbolic(prog)
+    except SymbolicOpNotSupported as e:
+        assert "rational" in str(e).lower() or "DIV_S" in str(e) or "REM_S" in str(e)
+    else:
+        raise AssertionError(
+            "expected SymbolicOpNotSupported for ADD on RationalPoly"
+        )
 
 
 def test_pop_underflow_raises():

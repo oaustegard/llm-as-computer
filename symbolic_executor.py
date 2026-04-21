@@ -567,12 +567,27 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
             stack.append(stack[-1])
         elif op == isa.OP_ADD:
             b = _pop(); a = _pop()
+            if not isinstance(a, Poly) or not isinstance(b, Poly):
+                raise SymbolicOpNotSupported(
+                    "ADD on rational stack entries is out of scope "
+                    "(composition past one DIV_S/REM_S is a follow-up)"
+                )
             stack.append(a + b)
         elif op == isa.OP_SUB:
             b = _pop(); a = _pop()
+            if not isinstance(a, Poly) or not isinstance(b, Poly):
+                raise SymbolicOpNotSupported(
+                    "SUB on rational stack entries is out of scope "
+                    "(composition past one DIV_S/REM_S is a follow-up)"
+                )
             stack.append(a - b)
         elif op == isa.OP_MUL:
             b = _pop(); a = _pop()
+            if not isinstance(a, Poly) or not isinstance(b, Poly):
+                raise SymbolicOpNotSupported(
+                    "MUL on rational stack entries is out of scope "
+                    "(composition past one DIV_S/REM_S is a follow-up)"
+                )
             stack.append(a * b)
         elif op == isa.OP_DIV_S:
             b = _pop(); a = _pop()
@@ -1013,12 +1028,27 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
         stack.append(stack[-1])
     elif op == isa.OP_ADD:
         b = _pop(); a = _pop()
+        if not isinstance(a, Poly) or not isinstance(b, Poly):
+            raise SymbolicOpNotSupported(
+                "ADD on rational stack entries is out of scope "
+                "(composition past one DIV_S/REM_S is a follow-up)"
+            )
         stack.append(arithmetic_ops.add(a, b))
     elif op == isa.OP_SUB:
         b = _pop(); a = _pop()
+        if not isinstance(a, Poly) or not isinstance(b, Poly):
+            raise SymbolicOpNotSupported(
+                "SUB on rational stack entries is out of scope "
+                "(composition past one DIV_S/REM_S is a follow-up)"
+            )
         stack.append(arithmetic_ops.sub(a, b))
     elif op == isa.OP_MUL:
         b = _pop(); a = _pop()
+        if not isinstance(a, Poly) or not isinstance(b, Poly):
+            raise SymbolicOpNotSupported(
+                "MUL on rational stack entries is out of scope "
+                "(composition past one DIV_S/REM_S is a follow-up)"
+            )
         stack.append(arithmetic_ops.mul(a, b))
     elif op == isa.OP_DIV_S:
         b = _pop(); a = _pop()
