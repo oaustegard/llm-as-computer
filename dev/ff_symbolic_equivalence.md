@@ -201,7 +201,7 @@ Two programs move from `blocked_opcode` to `collapsed`:
 `native_divmod(2, 7)` (a `RationalPoly` of `7 / 2` → 3) and
 `native_remainder(2, 7)` (a `SymbolicRemainder` of `7 mod 2` → 1). The
 `CatalogRow.is_rational` flag marks them; `poly_expr` renders as
-`"(pb) /ₜ (pa)"` / `"(pb) modₜ (pa)"`; eml-sr columns stay `–`
+`"(num) /ₜ (denom)"` / `"(num) %ₜ (denom)"`; eml-sr columns stay `–`
 because the single `eml(x, y) = exp(x) − ln(y)` operator has no
 division primitive.
 
