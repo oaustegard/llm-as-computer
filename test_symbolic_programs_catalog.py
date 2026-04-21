@@ -115,7 +115,21 @@ def test_classify_guarded_on_symbolic_branch():
 
 
 def test_classify_blocks_nonpolynomial_opcode():
-    # PUSH 2, PUSH 7, DIV_S, HALT
+    # PUSH, AND: AND is outside _POLY_OPS (bitwise).
+    # DIV_S / REM_S are in scope per issue #75.
+    prog = [
+        isa.Instruction(isa.OP_PUSH, 12),
+        isa.Instruction(isa.OP_PUSH, 10),
+        isa.Instruction(isa.OP_AND),
+        isa.Instruction(isa.OP_HALT),
+    ]
+    cr = classify_program(prog)
+    assert cr.status == "blocked_opcode"
+    assert cr.blocker == "AND"
+
+
+def test_classify_rational_top_on_div_s():
+    """DIV_S at HALT now collapses to a RationalPoly (issue #75)."""
     prog = [
         isa.Instruction(isa.OP_PUSH, 2),
         isa.Instruction(isa.OP_PUSH, 7),
@@ -123,8 +137,23 @@ def test_classify_blocks_nonpolynomial_opcode():
         isa.Instruction(isa.OP_HALT),
     ]
     cr = classify_program(prog)
-    assert cr.status == "blocked_opcode"
-    assert cr.blocker == "DIV_S"
+    assert cr.status == "collapsed", cr.status
+    assert cr.rational is not None
+    assert cr.poly is None
+
+
+def test_classify_rational_top_on_rem_s():
+    """REM_S at HALT collapses to a SymbolicRemainder (issue #75)."""
+    prog = [
+        isa.Instruction(isa.OP_PUSH, 2),
+        isa.Instruction(isa.OP_PUSH, 7),
+        isa.Instruction(isa.OP_REM_S),
+        isa.Instruction(isa.OP_HALT),
+    ]
+    cr = classify_program(prog)
+    assert cr.status == "collapsed", cr.status
+    assert cr.rational is not None
+    assert cr.poly is None
 
 
 def test_classify_first_blocker_wins():

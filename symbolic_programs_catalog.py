@@ -40,7 +40,9 @@ from symbolic_executor import (
     Guard,
     GuardedPoly,
     Poly,
+    RationalPoly,
     SymbolicOpNotSupported,
+    SymbolicRemainder,
     SymbolicStackUnderflow,
     run_forking,
     run_symbolic,
@@ -100,6 +102,7 @@ def poly_to_expr(poly: Poly, var_prefix: str = "x") -> str:
 _POLY_OPS = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
+    isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
 }
 # Control flow — handled by the forking executor (issue #70).
@@ -124,6 +127,9 @@ class ClassificationResult:
     blocker: Optional[str] = None
     poly: Optional[Poly] = None           # present when status == collapsed*
     guarded: Optional[GuardedPoly] = None # present when status == collapsed_guarded
+    # Rational tops (issue #75) — present when the program ends on a single
+    # DIV_S (RationalPoly) or REM_S (SymbolicRemainder).
+    rational: Optional[Any] = None        # Union[RationalPoly, SymbolicRemainder]
     n_heads: int = 0
     bindings: Dict[int, int] = field(default_factory=dict)
     n_cases: int = 0                       # number of cases in guarded output
@@ -170,6 +176,11 @@ def classify_program(prog) -> ClassificationResult:
         return ClassificationResult(status=STATUS_BLOCKED_UNDERFLOW)
 
     if r_sym.status == "straight":
+        if isinstance(r_sym.top, (RationalPoly, SymbolicRemainder)):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED, rational=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
         top = r_sym.top if isinstance(r_sym.top, Poly) else None
         return ClassificationResult(
             status=STATUS_COLLAPSED, poly=top,
@@ -282,8 +293,11 @@ def _default_catalog() -> List[CatalogEntry]:
         expected=20,
     ))
 
-    # Blocked — non-polynomial opcodes
+    # Rational tops (issue #75) — collapse to RationalPoly / SymbolicRemainder.
     entries.append(CatalogEntry("native_divmod(2,7)",   *P.make_native_divmod(2, 7)))
+    entries.append(CatalogEntry("native_remainder(2,7)", *P.make_native_remainder(2, 7)))
+
+    # Blocked — non-polynomial opcodes
     entries.append(CatalogEntry("native_clz(16)",       *P.make_native_clz(16)))
     entries.append(CatalogEntry("native_abs_unary(-3)", *P.make_native_abs_unary(-3)))
     entries.append(CatalogEntry("native_neg(5)",        *P.make_native_neg(5)))
@@ -350,6 +364,11 @@ class CatalogRow:
     eml_guard_size: Optional[int] = None     # sum of guard-poly sizes across every case
     eml_guard_depth: Optional[int] = None    # max guard-poly depth across every case
     case_eml: Optional[List[GuardedCaseEML]] = None
+    # Rational top flag (issue #75) — True for programs that collapse to
+    # a RationalPoly / SymbolicRemainder rather than a pure Poly. eml_* /
+    # n_monomials fields stay ``None`` for these rows since eml-sr has no
+    # division primitive; ``poly_expr`` renders the rational form.
+    is_rational: bool = False
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -420,7 +439,9 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         row.numpy_top = _numpy_top(np_exec, entry.prog)
 
         if cr.status == STATUS_COLLAPSED or cr.status == STATUS_COLLAPSED_UNROLLED:
-            if cr.poly is not None:
+            if cr.rational is not None:
+                _fill_rational_row(row, cr.rational, cr.bindings, row.numpy_top)
+            elif cr.poly is not None:
                 _fill_poly_row(row, cr.poly, cr.bindings, row.numpy_top)
             elif cr.guarded is not None:
                 # Unrolled + guarded (rare) — fall through to guarded formatter
@@ -451,6 +472,37 @@ def _fill_poly_row(row: CatalogRow, poly: Poly,
                         if v in bindings}
         eml_val = eval_eml(tree, eml_bindings) if eml_bindings or not poly.variables() else None
     row.numeric_match = _three_way_numeric_match(numpy_top, sym_val, eml_val)
+
+
+def _fill_rational_row(row: CatalogRow, rational,
+                       bindings: Dict[int, int],
+                       numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from a rational top (issue #75).
+
+    ``rational`` is a :class:`RationalPoly` (DIV_S) or
+    :class:`SymbolicRemainder` (REM_S). Renders as ``"num /ₜ denom"`` /
+    ``"num modₜ denom"``; evaluates via the wrapper's ``eval_at`` so
+    truncation toward zero (WASM ``i32.div_s`` / ``i32.rem_s`` semantics)
+    is applied at the boundary. eml-sr columns stay ``None`` — elementary
+    expressions in the single ``eml(x, y) = exp(x) - ln(y)`` operator
+    have no division primitive.
+    """
+    row.is_rational = True
+    row.poly_expr = repr(rational)
+    # n_monomials summarises the expression complexity: sum of the two
+    # underlying Polys' term counts, giving a meaningful size proxy even
+    # without an EML tree.
+    row.n_monomials = rational.num.n_monomials() + rational.denom.n_monomials()
+
+    try:
+        sym_val = rational.eval_at(bindings) if bindings else rational.eval_at({})
+    except (KeyError, ValueError, ZeroDivisionError):
+        sym_val = None
+
+    if sym_val is None or numpy_top is None:
+        row.numeric_match = None
+    else:
+        row.numeric_match = (sym_val == numpy_top)
 
 
 def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,

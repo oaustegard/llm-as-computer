@@ -36,7 +36,14 @@ import ff_symbolic as ff
 import isa
 from executor import CompiledModel, NumPyExecutor
 from isa import DIM_VALUE, program
-from symbolic_executor import GuardedPoly, Poly, run_forking, run_symbolic
+from symbolic_executor import (
+    GuardedPoly,
+    Poly,
+    RationalPoly,
+    SymbolicRemainder,
+    run_forking,
+    run_symbolic,
+)
 from symbolic_programs_catalog import (
     STATUS_COLLAPSED,
     STATUS_COLLAPSED_GUARDED,
@@ -437,6 +444,138 @@ def test_sum_of_squares_pin():
     _check("sum_of_squares eval", fs.top.eval_at({0: 3, 1: 4}) == 25)
 
 
+# ─── Rational primitives (issue #75) ──────────────────────────────
+
+def test_primitives_div_rem_s():
+    """forward_div_s / forward_rem_s agree with Python trunc_div / trunc_rem.
+
+    Covers sign combinations and the zero-divisor check deliberately
+    skipped: the numeric path raises via ``_trunc_div`` when the divisor
+    is zero, so we only exercise non-zero divisors here.
+    """
+    samples: List[Tuple[int, int]] = [
+        # (a, b) where a is top (va), b is stack[SP-1] (vb); op computes
+        # trunc_div(vb, va), trunc_rem(vb, va) — matches WASM i32.div_s.
+        (3, 10), (-3, 10), (3, -10), (-3, -10),
+        (7, 0), (1, 2**15),
+    ]
+    for a, b in samples:
+        if a == 0:
+            continue
+        ea, eb = ff.E(a), ff.E(b)
+        expected_q = isa._trunc_div(b, a)
+        expected_r = isa._trunc_rem(b, a)
+        _check(f"forward_div_s({a},{b})",
+               ff.E_inv(ff.forward_div_s(ea, eb)) == expected_q,
+               f"got {ff.E_inv(ff.forward_div_s(ea, eb))}, expect {expected_q}")
+        _check(f"forward_rem_s({a},{b})",
+               ff.E_inv(ff.forward_rem_s(ea, eb)) == expected_r,
+               f"got {ff.E_inv(ff.forward_rem_s(ea, eb))}, expect {expected_r}")
+
+
+def test_primitives_rational_matrix_shapes():
+    """M_DIV_S / M_REM_S are pair-selectors (shape (2, 2*d_model))."""
+    d = ff.D_MODEL
+    _check("M_DIV_S shape", ff.M_DIV_S.shape == (2, 2 * d))
+    _check("M_REM_S shape", ff.M_REM_S.shape == (2, 2 * d))
+
+    # Row 0 pulls va from ea[DIM_VALUE]; row 1 pulls vb from eb[DIM_VALUE].
+    for name, W in (("M_DIV_S", ff.M_DIV_S), ("M_REM_S", ff.M_REM_S)):
+        _check(f"{name}[0, DIM_VALUE] == 1",
+               float(W[0, DIM_VALUE].item()) == 1.0)
+        _check(f"{name}[1, d+DIM_VALUE] == 1",
+               float(W[1, d + DIM_VALUE].item()) == 1.0)
+        nonzero = (W != 0).sum().item()
+        _check(f"{name} has exactly 2 nonzeros", nonzero == 2)
+
+
+def test_symbolic_rational_primitives():
+    """symbolic_div_s / rem_s return RationalPoly / SymbolicRemainder."""
+    x0, x1 = Poly.variable(0), Poly.variable(1)
+    q = ff.symbolic_div_s(x0, x1)           # pa=x0=top, pb=x1=SP-1 → x1 / x0
+    r = ff.symbolic_rem_s(x0, x1)
+    _check("symbolic_div_s returns RationalPoly", isinstance(q, RationalPoly))
+    _check("symbolic_rem_s returns SymbolicRemainder", isinstance(r, SymbolicRemainder))
+    _check("symbolic_div_s num == pb", q.num == x1, f"got {q.num!r}")
+    _check("symbolic_div_s denom == pa", q.denom == x0, f"got {q.denom!r}")
+    _check("symbolic_rem_s num == pb", r.num == x1)
+    _check("symbolic_rem_s denom == pa", r.denom == x0)
+
+
+def test_equivalence_rational():
+    """forward_symbolic on DIV_S / REM_S programs matches run_symbolic structurally.
+
+    Both interpreters carry the (num, denom) pair forward — the
+    :class:`RationalPoly` / :class:`SymbolicRemainder` wrappers — and
+    evaluating either at the catalog's bindings must match the numeric
+    ``NumPyExecutor`` top bit-for-bit.
+    """
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+
+    cases = [
+        # (name, prog) — mirrors catalog entries that now collapse. Inputs
+        # are kept non-negative so the ℤ-valued rational eval agrees with
+        # the masked u32 :class:`NumPyExecutor` top (parity at the boundary
+        # per the Option (a) range assumption from issue #69).
+        ("native_divmod(2,7)",
+         program(("PUSH", 7), ("PUSH", 2), ("DIV_S",), ("HALT",))),
+        ("native_remainder(2,7)",
+         program(("PUSH", 7), ("PUSH", 2), ("REM_S",), ("HALT",))),
+        ("native_divmod(3,10)",
+         program(("PUSH", 10), ("PUSH", 3), ("DIV_S",), ("HALT",))),
+        ("native_remainder(3,10)",
+         program(("PUSH", 10), ("PUSH", 3), ("REM_S",), ("HALT",))),
+    ]
+    for name, prog_ in cases:
+        sym_result = run_symbolic(prog_)
+        fs_result = model.forward_symbolic(prog_)
+        _check(
+            f"rational.struct[{name}]",
+            type(sym_result.top) is type(fs_result.top),
+            f"sym={type(sym_result.top).__name__}, ff={type(fs_result.top).__name__}",
+        )
+        _check(
+            f"rational.num[{name}]",
+            sym_result.top.num == fs_result.top.num,
+            f"sym.num={sym_result.top.num!r} vs ff.num={fs_result.top.num!r}",
+        )
+        _check(
+            f"rational.denom[{name}]",
+            sym_result.top.denom == fs_result.top.denom,
+            f"sym.denom={sym_result.top.denom!r} vs ff.denom={fs_result.top.denom!r}",
+        )
+        # Three-way numeric match: sym eval == ff eval == NumPy.
+        sym_val = sym_result.top.eval_at(sym_result.bindings)
+        ff_val = fs_result.top.eval_at(fs_result.bindings)
+        np_trace = np_exec.execute(prog_)
+        np_top = np_trace.steps[-1].top
+        _check(
+            f"rational.numeric[{name}]",
+            sym_val == ff_val == np_top,
+            f"sym={sym_val}, ff={ff_val}, np={np_top}",
+        )
+
+
+def test_rational_catalog_rows_classify_as_collapsed():
+    """native_divmod / native_remainder catalog entries collapse (#75)."""
+    names_of_interest = {"native_divmod(2,7)", "native_remainder(2,7)"}
+    for entry in _default_catalog():
+        if entry.name not in names_of_interest:
+            continue
+        cr = classify_program(entry.prog)
+        _check(
+            f"catalog.status[{entry.name}] == collapsed",
+            cr.status == STATUS_COLLAPSED,
+            f"got {cr.status} (blocker={cr.blocker})",
+        )
+        _check(
+            f"catalog.rational[{entry.name}] is set",
+            cr.rational is not None,
+            f"got {cr.rational!r}",
+        )
+
+
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
 def test_blocked_opcodes():
@@ -496,6 +635,11 @@ def main():
         test_equivalence_unrolled_numeric,
         test_dup_add_chain_pin,
         test_sum_of_squares_pin,
+        test_primitives_div_rem_s,
+        test_primitives_rational_matrix_shapes,
+        test_symbolic_rational_primitives,
+        test_equivalence_rational,
+        test_rational_catalog_rows_classify_as_collapsed,
         test_blocked_opcodes,
     ]
     print("=" * 60)
