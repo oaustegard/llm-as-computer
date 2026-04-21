@@ -40,21 +40,47 @@ Out of scope (file as follow-ups):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import isa
+from isa import _trunc_div, _trunc_rem
 
 
 # ─── Poly ──────────────────────────────────────────────────────────
 #
-# Polynomial over integer-indexed symbolic variables with integer
-# coefficients. Canonical form: terms is a dict keyed by a monomial
-# (tuple of (var_idx, power) pairs, sorted by var_idx, powers > 0).
-# The empty tuple `()` is the constant monomial. Zero-coefficient
-# terms are dropped on construction so comparisons are value-equal
-# when the polynomials are mathematically equal.
+# Polynomial over integer-indexed symbolic variables with rational
+# (``int`` or :class:`fractions.Fraction`) coefficients. Canonical form:
+# ``terms`` is a dict keyed by a monomial (tuple of (var_idx, power)
+# pairs, sorted by var_idx, powers > 0). The empty tuple ``()`` is the
+# constant monomial. Zero-coefficient terms are dropped on construction
+# so comparisons are value-equal when the polynomials are mathematically
+# equal.
+#
+# Rational coefficients land via issue #75 (symbolic DIV_S / REM_S): the
+# bilinear forms for ADD/SUB/MUL produce polynomials over ℤ, but DIV_S
+# introduces rational polynomials (``a/b`` with integer ``a, b``). To keep
+# one canonical type, coefficients accept ``int | Fraction`` and
+# normalise to ``int`` whenever the denominator is 1 — so every Poly
+# produced by ADD/SUB/MUL still has literal ``int`` coefficients and
+# existing structural-equality tests remain green.
 
 Monomial = Tuple[Tuple[int, int], ...]
+
+
+def _norm_coeff(c):
+    """Normalise a coefficient to ``int`` when integral, else ``Fraction``.
+
+    Accepts ``int`` or ``Fraction`` input. The canonical form keeps
+    integer coefficients as ``int`` so value-compare against the
+    pre-#75 Polys still works and ``repr`` output stays unchanged for
+    the ADD/SUB/MUL fragment.
+    """
+    if isinstance(c, Fraction):
+        if c.denominator == 1:
+            return int(c.numerator)
+        return c
+    return int(c)
 
 
 def _mono_mul(a: Monomial, b: Monomial) -> Monomial:
@@ -82,17 +108,20 @@ def _mono_str(mono: Monomial) -> str:
 
 @dataclass(frozen=True)
 class Poly:
-    """Multivariate polynomial with integer coefficients.
+    """Multivariate polynomial with rational coefficients.
 
-    `terms` maps a monomial (canonical-form tuple) to its coefficient.
-    Zero-coefficient entries are never stored.
+    ``terms`` maps a monomial (canonical-form tuple) to its coefficient,
+    which is ``int`` when the coefficient is integral and
+    :class:`fractions.Fraction` when the denominator is >1. Zero-
+    coefficient entries are never stored.
     """
 
-    terms: Mapping[Monomial, int]
+    terms: Mapping[Monomial, Union[int, Fraction]]
 
     @staticmethod
-    def _normalise(terms: Mapping[Monomial, int]) -> Dict[Monomial, int]:
-        return {m: int(c) for m, c in terms.items() if c != 0}
+    def _normalise(terms: Mapping[Monomial, Union[int, Fraction]]
+                   ) -> Dict[Monomial, Union[int, Fraction]]:
+        return {m: _norm_coeff(c) for m, c in terms.items() if c != 0}
 
     def __post_init__(self):
         # Freeze a normalised copy. Doing it this way so callers can pass
@@ -102,10 +131,10 @@ class Poly:
     # ── Constructors ──────────────────────────────────────────
 
     @classmethod
-    def constant(cls, c: int) -> "Poly":
+    def constant(cls, c: Union[int, Fraction]) -> "Poly":
         if c == 0:
             return cls({})
-        return cls({(): int(c)})
+        return cls({(): _norm_coeff(c)})
 
     @classmethod
     def variable(cls, idx: int) -> "Poly":
@@ -149,19 +178,22 @@ class Poly:
                 seen.add(v)
         return sorted(seen)
 
-    def eval_at(self, bindings: Mapping[int, int]) -> int:
-        """Substitute `bindings[i]` for each ``x_i`` and reduce to an int.
+    def eval_at(self, bindings: Mapping[int, int]) -> Union[int, Fraction]:
+        """Substitute ``bindings[i]`` for each ``x_i`` and reduce.
 
-        Missing variables raise KeyError — symbolic executors that emit
-        a variable per PUSH should pass one binding per PUSH.
+        Returns ``int`` when the result is integral (the common case for
+        ADD/SUB/MUL Polys), otherwise returns :class:`fractions.Fraction`
+        (after a DIV_S introduces a rational coefficient). Missing
+        variables raise ``KeyError`` — symbolic executors that emit a
+        variable per PUSH should pass one binding per PUSH.
         """
-        total = 0
+        total: Union[int, Fraction] = 0
         for mono, coeff in self.terms.items():
-            term = coeff
+            term: Union[int, Fraction] = coeff
             for v, p in mono:
                 term *= bindings[v] ** p
             total += term
-        return int(total)
+        return _norm_coeff(total)
 
     # ── Equality / display ────────────────────────────────────
 
