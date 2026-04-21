@@ -1,4 +1,10 @@
-"""Bilinear FF dispatch for ADD/SUB/MUL (issue #69).
+"""Bilinear FF dispatch for ADD/SUB/MUL + DIV_S/REM_S + comparisons.
+
+Issue #69 introduced this module for the polynomial-closed core
+(ADD/SUB/MUL); issue #75 extended it to DIV_S / REM_S via a pair-
+selector matrix plus a boundary truncation; issue #76 extends it
+further to the comparison opcodes (EQ / NE / LT_S / GT_S / LE_S /
+GE_S / EQZ).
 
 Closes the gap between "the ISA semantics compose into a polynomial"
 (proven by :mod:`symbolic_executor`) and "the transformer weights
@@ -68,12 +74,51 @@ Composition past a single DIV_S / REM_S on the same stack slot is not
 supported in this issue — a subsequent arithmetic op on a rational
 stack entry raises ``SymbolicOpNotSupported``. That is a follow-up.
 
+Comparison extension (issue #76)
+--------------------------------
+WASM ``i32.eq`` / ``i32.lt_s`` / ... return ``1 if (vb REL va) else 0``,
+a piecewise function: not polynomial. We model them as **gated bilinear
+forms**: a *linear* matrix ``M_CMP`` extracts the single scalar
+``vb − va`` from the stacked input, and the relation gate
+``1 if (diff REL 0) else 0`` is applied at the boundary — the same
+"polynomial inside, non-polynomial step at the edge" pattern DIV_S /
+REM_S already use. EQZ is the unary case: ``M_EQZ`` extracts ``va``
+and the gate fires on ``va == 0``.
+
+This is "gated" rather than truly bilinear because the gate fires
+*after* the linear extraction — ``B = e_DIM_VALUE ⊗ e_DIM_VALUE``
+would be the bilinear product (used by MUL); for comparisons the
+output is a Boolean indicator on the difference, not the product.
+Symbolically this becomes :class:`symbolic_executor.IndicatorPoly` —
+a (poly, relation) pair whose ``eval_at`` applies the gate.
+
+The cost is the same as DIV_S: comparisons leave the polynomial ring,
+so composition past one comparison (e.g. ``LT_S; ADD``) raises
+:class:`BlockedOpcodeForSymbolic`. The catalog rows this unblocks
+(``compare_lt_s``, ``compare_eqz``, ``native_max``) all either halt
+on the indicator directly or feed it to JZ/JNZ, where the forking
+executor hoists the relation into a :class:`Guard` rather than
+composing it.
+
+Refactoring guards as sign indicators (S1 follow-up)
+----------------------------------------------------
+Pre-#76 :class:`Guard` only carried an ``eq_zero: bool``. M2 broadens
+it to a six-relation enum so the same data shape that backs
+``IndicatorPoly`` also backs guards — i.e. a guard *is* a sign
+indicator we've asserted to hold along a path. PR #71's S1 worked
+hard to express LT_S/GE_S/etc. via "synthetic ``cond − threshold``"
+guards on the EQ/NE-only Guard; once everything goes through the
+relation field, that synthesis collapses to a straight pass-through.
+The catalog renderer (``symbolic_programs_catalog._guard_to_expr``)
+is the natural follow-up site to migrate.
+
 Scope
 -----
 ADD/SUB/MUL via true (bi)linear forms; DIV_S/REM_S via pair-selector
-+ boundary trunc (issue #75). Comparisons, bitwise, unary numeric
-ops, control flow — all unchanged, and all explicit follow-ups per
-the issue's "Non-goals" section.
++ boundary trunc (issue #75); comparisons via diff-extractor +
+relation gate (issue #76). Bitwise, unary numeric ops, control
+flow — all unchanged, and all explicit follow-ups per the issue's
+"Non-goals" section.
 """
 
 from __future__ import annotations
@@ -88,10 +133,13 @@ from isa import DIM_VALUE, D_MODEL, DTYPE, _trunc_div, _trunc_rem
 from symbolic_executor import (
     ArithmeticOps,
     ForkingResult,
+    IndicatorPoly,
     Poly,
     RationalPoly,
     RationalStackValue,
+    REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE,
     SymbolicRemainder,
+    _relation_holds,
     run_forking,
 )
 
@@ -229,24 +277,68 @@ def _M_REM_S_matrix(d_model: int = D_MODEL) -> torch.Tensor:
     return W
 
 
+def _M_CMP_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Diff-extractor for binary comparisons (issue #76).
+
+    Shape: ``(1, 2*d_model)``. Computes the single scalar
+    ``diff = vb - va`` from the stacked input ``[E(a); E(b)]``. The
+    relation gate (``1 if diff REL 0 else 0``) is applied at the
+    boundary by :func:`forward_cmp`, mirroring the DIV_S boundary-trunc
+    pattern.
+
+    All six binary comparisons share this matrix — only the gate
+    differs. Two non-zero entries: ``-1`` at ``DIM_VALUE`` (coefficient
+    of ``va``, the top), ``+1`` at ``d_model + DIM_VALUE`` (coefficient
+    of ``vb``, stack[SP-1]).
+    """
+    W = torch.zeros(1, 2 * d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = -1.0                          # coefficient of a (top)
+    W[0, d_model + DIM_VALUE] = 1.0                 # coefficient of b (SP-1)
+    return W
+
+
+def _M_EQZ_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Single-value extractor for EQZ (issue #76).
+
+    Shape: ``(1, d_model)``. Plucks ``va`` from ``E(a)`` so the gate
+    can fire on ``va == 0`` at the boundary. EQZ is the unary
+    degenerate case of the comparison family — the difference
+    extraction collapses to "just read the value".
+    """
+    W = torch.zeros(1, d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = 1.0
+    return W
+
+
 # Module-scope cached tensors — read-only; wrapped on access.
 M_ADD: torch.Tensor = _M_ADD_matrix()
 M_SUB: torch.Tensor = _M_SUB_matrix()
 B_MUL: torch.Tensor = _B_MUL_matrix()
 M_DIV_S: torch.Tensor = _M_DIV_S_matrix()
 M_REM_S: torch.Tensor = _M_REM_S_matrix()
+M_CMP: torch.Tensor = _M_CMP_matrix()
+M_EQZ: torch.Tensor = _M_EQZ_matrix()
 
 
 def n_parameters(d_model: int = D_MODEL) -> int:
     """Parameter count contributed by the analytically-set FF weights.
 
-    Counts non-zero entries across all five matrices:
-    2 (M_ADD) + 2 (M_SUB) + 1 (B_MUL) + 2 (M_DIV_S) + 2 (M_REM_S) = 9.
-    The stored tensors are larger but the analytically-set content is nine
-    bits. Issue #69 shipped with the first three (for 5 non-zeros); issue
-    #75 added M_DIV_S / M_REM_S.
+    Counts non-zero entries across all matrices:
+
+    * ``M_ADD``     2 (two ``+1`` coefficients)
+    * ``M_SUB``     2 (one ``+1``, one ``-1``)
+    * ``B_MUL``     1 (single rank-1 outer product)
+    * ``M_DIV_S``   2 (pair-selector for ``(va, vb)``)
+    * ``M_REM_S``   2 (pair-selector for ``(va, vb)``)
+    * ``M_CMP``     2 (diff-extractor; shared by all six binary comparisons)
+    * ``M_EQZ``     1 (single-value extractor)
+
+    Total: 12. The stored tensors are larger but the analytically-set
+    content is twelve bits. The six binary comparisons share ``M_CMP``
+    so their cost is the matrix entries plus six relation gates (the
+    gates are control-flow, not parameters).
     """
-    return 9
+    return 12
 
 
 # ─── Numeric primitives (float tensors) ───────────────────────────
@@ -316,6 +408,62 @@ def forward_rem_s(ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# Map from comparison opcode (binary) to the relation code applied to
+# ``vb − va``. Single source of truth shared by the symbolic and
+# numeric forward paths so they cannot drift.
+_OP_RELATION = {
+    isa.OP_EQ: REL_EQ,
+    isa.OP_NE: REL_NE,
+    isa.OP_LT_S: REL_LT,
+    isa.OP_GT_S: REL_GT,
+    isa.OP_LE_S: REL_LE,
+    isa.OP_GE_S: REL_GE,
+}
+
+
+def forward_cmp(ea: torch.Tensor, eb: torch.Tensor, op: int) -> torch.Tensor:
+    """Compute ``E(1 if (vb REL va) else 0)`` for one of the six binary cmps.
+
+    ``op`` is one of ``isa.OP_EQ / OP_NE / OP_LT_S / OP_GT_S / OP_LE_S
+    / OP_GE_S``. Applies ``M_CMP`` as a diff-extractor (``diff = vb - va``
+    via the ``(1, 2*d_model)`` linear form), then the relation gate at
+    the boundary. The output is re-embedded via ``E`` so the result
+    shares the same scalar-at-``DIM_VALUE`` layout as every other value
+    in the model — a downstream FF can read it back without any
+    re-projection.
+
+    The gate is an ``int(_relation_holds(...))`` call: not a matmul.
+    That's the honest cost of integer-valued comparisons in a polynomial
+    framework — same shape as DIV_S's ``_trunc_div`` boundary step.
+    """
+    relation = _OP_RELATION.get(op)
+    if relation is None:
+        raise ValueError(
+            f"forward_cmp: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"binary comparison opcode (expected one of {sorted(_OP_RELATION)})"
+        )
+    stacked = torch.cat([ea, eb])                    # shape (2*d_model,)
+    diff = float((M_CMP @ stacked).item())           # shape (), then scalar
+    bit = 1 if _relation_holds(relation, diff) else 0
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(bit)
+    return out
+
+
+def forward_eqz(ea: torch.Tensor) -> torch.Tensor:
+    """Compute ``E(1 if va == 0 else 0)`` from ``E(a)``.
+
+    Applies ``M_EQZ`` as a single-value extractor (``va = ea[DIM_VALUE]``
+    via the ``(1, d_model)`` linear form), then the equality gate at
+    the boundary. Unary degenerate case of :func:`forward_cmp`.
+    """
+    va = float((M_EQZ @ ea).item())
+    bit = 1 if _relation_holds(REL_EQ, va) else 0
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(bit)
+    return out
+
+
 # ─── Symbolic primitives (Poly values) ────────────────────────────
 #
 # These ARE polynomial algebra — ``Poly`` overloads ``+ - *`` — but they
@@ -361,11 +509,43 @@ def symbolic_rem_s(pa: Poly, pb: Poly) -> SymbolicRemainder:
     return SymbolicRemainder(num=pb, denom=pa)
 
 
+def symbolic_cmp(pa: Poly, pb: Poly, op: int) -> IndicatorPoly:
+    """Symbolic comparison; corresponds to ``forward_cmp`` over :class:`Poly`.
+
+    Order matches ``forward_cmp`` (``pa`` is top, ``pb`` is stack[SP-1]):
+    returns ``IndicatorPoly(poly=pb - pa, relation=_OP_RELATION[op])`` so
+    that ``vb REL va`` becomes ``(pb - pa) REL 0`` — the same identity
+    ``M_CMP``'s linear extraction realises numerically.
+
+    The gate fires only at :meth:`IndicatorPoly.eval_at`, mirroring
+    :class:`RationalPoly`'s boundary truncation. Composition past this
+    point (e.g. ``LT_S; ADD``) raises
+    :class:`symbolic_executor.SymbolicOpNotSupported` upstream.
+    """
+    relation = _OP_RELATION.get(op)
+    if relation is None:
+        raise ValueError(
+            f"symbolic_cmp: op {isa.OP_NAMES.get(op, op)!r} is not a "
+            f"binary comparison opcode (expected one of {sorted(_OP_RELATION)})"
+        )
+    return IndicatorPoly(poly=pb - pa, relation=relation)
+
+
+def symbolic_eqz(pa: Poly) -> IndicatorPoly:
+    """Symbolic EQZ; corresponds to ``forward_eqz`` over :class:`Poly`.
+
+    Returns ``IndicatorPoly(poly=pa, relation=REL_EQ)``; the gate
+    ``pa == 0`` fires at :meth:`IndicatorPoly.eval_at`.
+    """
+    return IndicatorPoly(poly=pa, relation=REL_EQ)
+
+
 # Arithmetic primitives packaged for :func:`symbolic_executor.run_forking`'s
-# ``arithmetic_ops`` hook (issue #68 S3; extended for DIV_S/REM_S in #75).
-# The wrappers flip arg order where needed: the forking executor's convention
-# is ``op(a, b)`` with ``a`` = stack[SP-1] and ``b`` = top. ``symbolic_sub`` /
-# ``symbolic_div_s`` / ``symbolic_rem_s`` are written in the FF ``(pa, pb)``
+# ``arithmetic_ops`` hook (issue #68 S3; extended for DIV_S/REM_S in #75;
+# extended for the comparison family in #76). The wrappers flip arg order
+# where needed: the forking executor's convention is ``op(a, b)`` with
+# ``a`` = stack[SP-1] and ``b`` = top. ``symbolic_sub`` / ``symbolic_div_s``
+# / ``symbolic_rem_s`` / ``symbolic_cmp`` are written in the FF ``(pa, pb)``
 # order where ``pa`` = top, ``pb`` = SP-1, so we call them with ``(b, a)``.
 FF_ARITHMETIC_OPS = ArithmeticOps(
     add=lambda a, b: symbolic_add(a, b),
@@ -373,6 +553,13 @@ FF_ARITHMETIC_OPS = ArithmeticOps(
     mul=lambda a, b: symbolic_mul(a, b),
     div_s=lambda a, b: symbolic_div_s(b, a),
     rem_s=lambda a, b: symbolic_rem_s(b, a),
+    cmp_eq=lambda a, b: symbolic_cmp(b, a, isa.OP_EQ),
+    cmp_ne=lambda a, b: symbolic_cmp(b, a, isa.OP_NE),
+    cmp_lt_s=lambda a, b: symbolic_cmp(b, a, isa.OP_LT_S),
+    cmp_gt_s=lambda a, b: symbolic_cmp(b, a, isa.OP_GT_S),
+    cmp_le_s=lambda a, b: symbolic_cmp(b, a, isa.OP_LE_S),
+    cmp_ge_s=lambda a, b: symbolic_cmp(b, a, isa.OP_GE_S),
+    eqz=lambda a: symbolic_eqz(a),
 )
 
 
@@ -387,6 +574,9 @@ _SCOPE_OPS = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT, isa.OP_NOP,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_DIV_S, isa.OP_REM_S,
+    isa.OP_EQ, isa.OP_NE,
+    isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
+    isa.OP_EQZ,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT,
 }
 
@@ -444,7 +634,8 @@ def evaluate_program(prog) -> SymbolicForwardResult:
         if op not in _SCOPE_OPS:
             raise BlockedOpcodeForSymbolic(
                 f"op {isa.OP_NAMES.get(op, f'?{op}')!r} is out of scope for the "
-                f"bilinear FF dispatch (ADD/SUB/MUL/DIV_S/REM_S + stack manip only)"
+                f"bilinear FF dispatch (ADD/SUB/MUL/DIV_S/REM_S + comparisons "
+                f"+ stack manip only)"
             )
         if op == isa.OP_HALT:
             break
@@ -479,6 +670,17 @@ def evaluate_program(prog) -> SymbolicForwardResult:
         elif op == isa.OP_REM_S:
             b = _require_poly(_pop(), "REM_S"); a = _require_poly(_pop(), "REM_S")
             stack.append(symbolic_rem_s(b, a))
+        elif op in _OP_RELATION:
+            # Binary comparison (issue #76). Pop order / arg convention
+            # matches the arithmetic ops above: b = top, a = SP-1. The
+            # symbolic primitive takes (pa, pb) in FF order (pa=top,
+            # pb=SP-1), so we call symbolic_cmp(b, a, op).
+            name = isa.OP_NAMES.get(op, f"?{op}")
+            b = _require_poly(_pop(), name); a = _require_poly(_pop(), name)
+            stack.append(symbolic_cmp(b, a, op))
+        elif op == isa.OP_EQZ:
+            a = _require_poly(_pop(), "EQZ")
+            stack.append(symbolic_eqz(a))
         elif op == isa.OP_SWAP:
             if len(stack) < 2:
                 raise IndexError("swap needs 2 entries")
@@ -529,12 +731,14 @@ __all__ = [
     "RangeCheckFailure",
     "I32_MIN", "I32_MAX",
     "E", "E_inv",
-    "M_ADD", "M_SUB", "B_MUL", "M_DIV_S", "M_REM_S",
+    "M_ADD", "M_SUB", "B_MUL", "M_DIV_S", "M_REM_S", "M_CMP", "M_EQZ",
     "n_parameters",
     "forward_add", "forward_sub", "forward_mul",
     "forward_div_s", "forward_rem_s",
+    "forward_cmp", "forward_eqz",
     "symbolic_add", "symbolic_sub", "symbolic_mul",
     "symbolic_div_s", "symbolic_rem_s",
+    "symbolic_cmp", "symbolic_eqz",
     "FF_ARITHMETIC_OPS",
     "SymbolicForwardResult",
     "evaluate_program",
