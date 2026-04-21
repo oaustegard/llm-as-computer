@@ -156,6 +156,7 @@ from symbolic_executor import (
     BitVec,
     ForkingResult,
     IndicatorPoly,
+    ModPoly,
     Poly,
     RationalPoly,
     RationalStackValue,
@@ -964,6 +965,152 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                                  n_heads=n_heads, bindings=bindings)
 
 
+# ─── Mod-2³² symbolic primitives (issue #78 option (b)) ───────────
+#
+# ``symbolic_add`` / ``symbolic_sub`` / ``symbolic_mul`` above realise the
+# FF bilinear form over ℤ — the equivalence theorem from issue #69 is
+# structural over ℤ under a :func:`range_check` assumption. Issue #78
+# adds a sibling fragment that carries the i32 wrap semantics through
+# the algebra itself: the same spec (M_ADD / M_SUB / B_MUL) interpreted
+# over :class:`ModPoly` closes the ``& MASK32`` gap symbolically.
+#
+# Concretely: ``forward_add / forward_sub / forward_mul`` on float tensors
+# compute ``(va + vb) & MASK32`` / etc. — the mask lives *outside* the
+# bilinear form in :meth:`executor.CompiledModel.forward`. On the
+# symbolic side, ``symbolic_add_mod`` / etc. evaluate the same operator
+# tree over :class:`ModPoly`, whose ``__post_init__`` reduces coefficients
+# modulo 2³² after every step. That reduction is the same ``& MASK32``,
+# now visible as a single line of algebra instead of a numeric-only
+# boundary fact.
+#
+# This is the "real work" option from issue #78 (as opposed to Option (a),
+# which pins :func:`range_check` and stops). It's orthogonal to the
+# Poly-over-ℤ fragment: both continue to work; ``ModPoly`` is a proof
+# artefact for the wrap case, not a replacement.
+
+
+def symbolic_add_mod(pa: ModPoly, pb: ModPoly) -> ModPoly:
+    """ModPoly addition; corresponds to ``forward_add`` over ℤ/2³².
+
+    Same spec as :func:`symbolic_add`, reinterpreted in the quotient
+    ring. The coefficient reduction in ``ModPoly.__post_init__`` is
+    precisely the ``& MASK32`` step ``CompiledModel.forward`` applies
+    after the bilinear form.
+    """
+    return pa + pb
+
+
+def symbolic_sub_mod(pa: ModPoly, pb: ModPoly) -> ModPoly:
+    """ModPoly subtraction; corresponds to ``forward_sub`` over ℤ/2³².
+
+    Order matches :func:`symbolic_sub`: returns ``pb - pa``.
+    """
+    return pb - pa
+
+
+def symbolic_mul_mod(pa: ModPoly, pb: ModPoly) -> ModPoly:
+    """ModPoly multiplication; corresponds to ``forward_mul`` over ℤ/2³²."""
+    return pa * pb
+
+
+# Ops this module understands when interpreting the program over ℤ/2³².
+# Narrower than ``_SCOPE_OPS``: option (b) only covers the polynomial-
+# closed fragment (ADD / SUB / MUL + stack manip). Everything else —
+# comparisons (boundary gate), rationals (boundary truncation), bit-ops
+# (non-polynomial over ℤ/2³² as well; bit decomposition lives in the
+# ``BitVec`` wrapper) — raises ``BlockedOpcodeForSymbolic``. Those
+# fragments already apply the correct wrap at their own boundaries.
+_SCOPE_OPS_MOD = {
+    isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT, isa.OP_NOP,
+    isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
+    isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT,
+}
+
+
+@dataclass
+class SymbolicForwardResultMod:
+    """Outcome of :func:`evaluate_program_mod` — mod-2³² sibling of
+    :class:`SymbolicForwardResult`. ``top`` is a :class:`ModPoly`.
+    """
+    top: ModPoly
+    stack: List[ModPoly]
+    n_heads: int
+    bindings: Dict[int, int]
+
+
+def evaluate_program_mod(prog) -> SymbolicForwardResultMod:
+    """Run ``prog`` through the bilinear FF interpreters over ℤ/2³².
+
+    Semantics match :func:`evaluate_program` restricted to the polynomial
+    fragment {ADD, SUB, MUL, PUSH, POP, DUP, HALT, NOP, SWAP, OVER, ROT}.
+    The one difference from the Poly-over-ℤ driver is the value type:
+    every stack entry is a :class:`ModPoly` whose coefficients are
+    reduced modulo 2³² after every arithmetic operation. Structurally
+    the output is ``ModPoly.from_poly(evaluate_program(prog).top)`` — a
+    theorem verified by :func:`test_ff_symbolic.test_modpoly_equivalence`.
+    """
+    stack: List[ModPoly] = []
+    bindings: Dict[int, int] = {}
+    next_var = 0
+    n_heads = 0
+
+    for instr in prog:
+        op = instr.op
+        if op not in _SCOPE_OPS_MOD:
+            raise BlockedOpcodeForSymbolic(
+                f"op {isa.OP_NAMES.get(op, f'?{op}')!r} is out of scope for "
+                f"the mod-2³² bilinear FF dispatch (ADD/SUB/MUL + stack "
+                f"manip only). Comparisons / rationals / bit-ops have their "
+                f"own boundary wrap in IndicatorPoly / RationalPoly / BitVec."
+            )
+        if op == isa.OP_HALT:
+            break
+        if op == isa.OP_NOP:
+            continue
+        n_heads += 1
+        if op == isa.OP_PUSH:
+            v = next_var
+            next_var += 1
+            bindings[v] = int(instr.arg)
+            stack.append(ModPoly.variable(v))
+        elif op == isa.OP_POP:
+            if not stack:
+                raise IndexError("symbolic stack underflow")
+            stack.pop()
+        elif op == isa.OP_DUP:
+            if not stack:
+                raise IndexError("dup on empty stack")
+            stack.append(stack[-1])
+        elif op == isa.OP_ADD:
+            b = stack.pop(); a = stack.pop()
+            stack.append(symbolic_add_mod(a, b))
+        elif op == isa.OP_SUB:
+            b = stack.pop(); a = stack.pop()
+            stack.append(symbolic_sub_mod(a, b))
+        elif op == isa.OP_MUL:
+            b = stack.pop(); a = stack.pop()
+            stack.append(symbolic_mul_mod(a, b))
+        elif op == isa.OP_SWAP:
+            if len(stack) < 2:
+                raise IndexError("swap needs 2 entries")
+            stack[-1], stack[-2] = stack[-2], stack[-1]
+        elif op == isa.OP_OVER:
+            if len(stack) < 2:
+                raise IndexError("over needs 2 entries")
+            stack.append(stack[-2])
+        elif op == isa.OP_ROT:
+            if len(stack) < 3:
+                raise IndexError("rot needs 3 entries")
+            a, b, c = stack[-3], stack[-2], stack[-1]
+            stack[-3], stack[-2], stack[-1] = b, c, a
+        else:  # pragma: no cover — guarded by _SCOPE_OPS_MOD above
+            raise BlockedOpcodeForSymbolic(f"unreachable: op {op}")
+
+    top = stack[-1] if stack else ModPoly.constant(0)
+    return SymbolicForwardResultMod(top=top, stack=list(stack),
+                                    n_heads=n_heads, bindings=bindings)
+
+
 def evaluate_program_forking(prog, *, input_mode: str = "symbolic") -> ForkingResult:
     """Run ``prog`` through :func:`symbolic_executor.run_forking` with the
     bilinear-FF ADD/SUB/MUL primitives (issue #68 S3).
@@ -1004,9 +1151,12 @@ __all__ = [
     "symbolic_div_s", "symbolic_rem_s",
     "symbolic_cmp", "symbolic_eqz",
     "symbolic_bit_binary", "symbolic_bit_unary", "symbolic_bit_arith",
+    "symbolic_add_mod", "symbolic_sub_mod", "symbolic_mul_mod",
     "FF_ARITHMETIC_OPS",
     "SymbolicForwardResult",
+    "SymbolicForwardResultMod",
     "evaluate_program",
+    "evaluate_program_mod",
     "evaluate_program_forking",
     "range_check",
 ]
