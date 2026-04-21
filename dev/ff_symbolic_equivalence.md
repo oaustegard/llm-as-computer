@@ -1,6 +1,6 @@
 # FF symbolic equivalence — the weights ARE the polynomial
 
-_Issue #69 writeup. Follow-up to #65 (PR #66 symbolic executor, PR #67 catalog runner)._
+_Issue #69 writeup. Follow-up to #65 (PR #66 symbolic executor, PR #67 catalog runner). Extended by #75 to cover DIV_S / REM_S via rational-pair algebra._
 
 ## The claim, in one sentence
 
@@ -68,8 +68,11 @@ standard basis. That choice makes the three constructions direct:
 | MUL | Bilinear | `B_MUL[DIM_VALUE, DIM_VALUE] = 1` (rank-1 outer product) | `E(a)^T B_MUL E(b) = a·b`              |
 
 Every other entry in those matrices is zero. The total weight budget
-added by this module is three non-zero values; the blog post's "964
-compiled parameters" becomes 967.
+added by #69 is five non-zero values
+(`M_ADD: 2, M_SUB: 2, B_MUL: 1`); the blog post's "964 compiled
+parameters" becomes 969. Issue #75 adds four more (`M_DIV_S: 2,
+M_REM_S: 2`) for a total of nine — see the rational-extension
+section below.
 
 Under the scalar embedding, ADD and SUB are linear (because `E` is a
 linear map on `ℤ`) and MUL is bilinear (a degree-2 polynomial, which is
@@ -126,6 +129,82 @@ The check at `test_ff_symbolic.py::test_dup_add_chain_pin`
 pins this equality; the parametrised `test_equivalence_structural`
 generalises it to all 15 currently-collapsed catalog programs.
 
+## Rational extension (issue #75)
+
+Integer division and remainder aren't polynomial operations over ℤ, so
+the `{ADD, SUB, MUL}` story above — "the weight matrix _is_ the
+operator" — doesn't extend cleanly. Issue #75 keeps that spirit going
+by pushing the arithmetic into the rational field ℚ up to the final
+truncation step:
+
+- `symbolic_executor.Poly` coefficients widen from `int` to
+  `int | Fraction`. `_normalise` still collapses ratios with denominator
+  1 back to `int`, so every structural Poly equality test from #69
+  continues to compare pure-`int` coefficients. Fraction only appears
+  inside a `RationalPoly` / `SymbolicRemainder` wrapper.
+- Two minimal wrappers carry ``(num, denom)`` pairs through the
+  symbolic stack:
+
+  ```python
+  @dataclass(frozen=True)
+  class RationalPoly:       # DIV_S result
+      num: Poly
+      denom: Poly
+      def eval_at(self, bindings): return _trunc_div(num_val, denom_val)
+
+  @dataclass(frozen=True)
+  class SymbolicRemainder:  # REM_S result
+      num: Poly
+      denom: Poly
+      def eval_at(self, bindings): return _trunc_rem(num_val, denom_val)
+  ```
+
+  `eval_at` is where the non-polynomial truncation lives: we collapse
+  to ℤ only at the boundary, matching WASM `i32.div_s` / `i32.rem_s`
+  semantics.
+- `ff_symbolic.M_DIV_S` / `M_REM_S` are 2 × 2·d_model **pair-selector**
+  matrices — they pluck `(va, vb)` from the stacked `[E(a); E(b)]`
+  input and feed them to the boundary `_trunc_div(vb, va)` /
+  `_trunc_rem(vb, va)`. Two non-zero entries each; the weight budget
+  (non-zero entries across all five matrices) is
+  `M_ADD(2) + M_SUB(2) + B_MUL(1) + M_DIV_S(2) + M_REM_S(2) = 9`.
+- `symbolic_div_s` / `symbolic_rem_s` are the polynomial-side
+  interpretation: construct `RationalPoly(num=pb, denom=pa)` /
+  `SymbolicRemainder(num=pb, denom=pa)` with `(pa, pb) = (top, SP-1)`
+  matching the numeric argument order.
+
+The equivalence theorem for the rational fragment is weaker than the
+bilinear-form story of #69 because integer-truncating division is a
+**non-linear boundary step**. The honest statement is:
+
+> For every DIV_S / REM_S catalog program P and its concrete bindings,
+> `run_symbolic(P).top` and `forward_symbolic(P).top` are structurally
+> equal (same wrapper, same num, same denom), and each evaluates — via
+> `eval_at` — to the same integer that `NumPyExecutor(P).top` reports,
+> provided the dividend and divisor are both in the positive i32 range
+> (so NumPy's `& MASK32` doesn't perturb the equality).
+
+### Composition non-goal
+
+A second DIV_S / REM_S / ADD / SUB / MUL applied to a `RationalPoly`
+or `SymbolicRemainder` raises `SymbolicOpNotSupported`
+(`BlockedOpcodeForSymbolic` on the FF side). Supporting composition
+would require either (a) a proper rational-function algebra with GCD
+cancellation (rational coefficients are insufficient because the
+numerator / denominator can share symbolic factors) or (b) delaying
+truncation through every subsequent op, which is unsound. Neither is
+small. Left to a follow-up.
+
+### Catalog impact
+
+Two programs move from `blocked_opcode` to `collapsed`:
+`native_divmod(2, 7)` (a `RationalPoly` of `7 / 2` → 3) and
+`native_remainder(2, 7)` (a `SymbolicRemainder` of `7 mod 2` → 1). The
+`CatalogRow.is_rational` flag marks them; `poly_expr` renders as
+`"(pb) /ₜ (pa)"` / `"(pb) modₜ (pa)"`; eml-sr columns stay `–`
+because the single `eml(x, y) = exp(x) − ln(y)` operator has no
+division primitive.
+
 ## Honest limits
 
 ### Range / i32-wrap
@@ -156,7 +235,11 @@ and no division) and is deliberately out of scope.
 
 Listing these explicitly so the PR description stays honest:
 
-- **DIV_S / REM_S** — require rational-function algebra; out of scope.
+- **DIV_S / REM_S beyond a single op at the top of the stack** —
+  covered for terminal DIV_S / REM_S by issue #75 (pair-selector +
+  boundary trunc), but composition *past* a rational stack entry
+  still raises. Full rational-function algebra (with GCD cancellation)
+  is a follow-up.
 - **Comparisons** (EQ, LT_S, GT_S, …) — piecewise, need sign indicators
   and/or Heaviside gating; out of scope.
 - **Bitwise** (AND, OR, XOR, shifts, rotates) — different algebra (mod-2
@@ -211,9 +294,11 @@ provably.
 
 Each of these is a separate issue:
 
-- **Rational-function algebra** for `DIV_S` / `REM_S`. The FF layer gains
-  a bilinear form over `(num, denom)` pairs; `Poly` becomes
-  `RationalPoly`.
+- **Rational-function algebra with composition.** #75 handled the
+  terminal DIV_S / REM_S case; supporting ADD / SUB / MUL / DIV_S /
+  REM_S applied to an already-rational stack entry is the next bite.
+  Needs GCD-based cancellation in the `Poly` ring (or a `RationalPoly`
+  type with an explicit normal form).
 - **Piecewise bilinear forms** for comparisons. A sign-indicator
   attention pattern gates into one of two output branches — the FF
   counterpart of the symbolic executor's forking model (#70).
@@ -225,9 +310,14 @@ visible.
 
 ## References
 
-- Parent issue: #65 · follow-up: #69
+- Parent issue: #65 · follow-ups: #69, #75
 - Symbolic executor: PR #66
 - Catalog runner + eml bridge: PR #67
 - Forking / guarded execution: PR #71 (issue #70)
-- This PR: `ff_symbolic.py`, `executor.py` (ADD/SUB/MUL + `forward_symbolic`),
-  `test_ff_symbolic.py`, this writeup.
+- ADD/SUB/MUL bilinear forms: this module (issue #69).
+- DIV_S / REM_S rational extension: issue #75 — adds
+  `RationalPoly` / `SymbolicRemainder` to `symbolic_executor.py`,
+  `M_DIV_S` / `M_REM_S` + `forward_div_s` / `forward_rem_s` +
+  `symbolic_div_s` / `symbolic_rem_s` to `ff_symbolic.py`, rational
+  rows to `symbolic_programs_catalog.py`, and the rational section
+  above to this writeup.

@@ -240,9 +240,11 @@ M_REM_S: torch.Tensor = _M_REM_S_matrix()
 def n_parameters(d_model: int = D_MODEL) -> int:
     """Parameter count contributed by the analytically-set FF weights.
 
-    Counts non-zero entries: 2 (M_ADD) + 2 (M_SUB) + 1 (B_MUL) + 2 (M_DIV_S)
-    + 2 (M_REM_S) = 9. The stored tensors are larger but the analytically-set
-    content is nine bits. Pre-#75 the count was 3 (ADD/SUB/MUL only).
+    Counts non-zero entries across all five matrices:
+    2 (M_ADD) + 2 (M_SUB) + 1 (B_MUL) + 2 (M_DIV_S) + 2 (M_REM_S) = 9.
+    The stored tensors are larger but the analytically-set content is nine
+    bits. Issue #69 shipped with the first three (for 5 non-zeros); issue
+    #75 added M_DIV_S / M_REM_S.
     """
     return 9
 
