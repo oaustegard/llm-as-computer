@@ -38,8 +38,15 @@ from executor import CompiledModel, NumPyExecutor
 from isa import DIM_VALUE, program
 from symbolic_executor import (
     GuardedPoly,
+    IndicatorPoly,
     Poly,
     RationalPoly,
+    REL_EQ,
+    REL_GE,
+    REL_GT,
+    REL_LE,
+    REL_LT,
+    REL_NE,
     SymbolicRemainder,
     run_forking,
     run_symbolic,
@@ -576,6 +583,218 @@ def test_rational_catalog_rows_classify_as_collapsed():
         )
 
 
+# ─── Comparison primitives (issue #76) ────────────────────────────
+
+def test_primitives_forward_cmp():
+    """forward_cmp(ea, eb, op) returns E(0/1) matching WASM semantics.
+
+    Convention: ``ea`` is va (top of stack), ``eb`` is vb (SP-1). The
+    WASM ``LT_S`` opcode computes ``1 if vb < va``, so with va=5, vb=3
+    → ``3 < 5`` → 1.
+    """
+    cases = [
+        # (op, va, vb, expected 0/1)
+        (isa.OP_LT_S, 5, 3, 1),  # 3 < 5
+        (isa.OP_LT_S, 3, 5, 0),
+        (isa.OP_LT_S, 4, 4, 0),  # not strict
+        (isa.OP_GT_S, 3, 5, 1),  # 5 > 3
+        (isa.OP_GT_S, 5, 3, 0),
+        (isa.OP_LE_S, 4, 4, 1),  # non-strict
+        (isa.OP_LE_S, 3, 4, 0),  # 4 <= 3 → False
+        (isa.OP_GE_S, 4, 4, 1),
+        (isa.OP_EQ,   7, 7, 1),
+        (isa.OP_EQ,   7, 3, 0),
+        (isa.OP_NE,   7, 3, 1),
+        (isa.OP_NE,   4, 4, 0),
+    ]
+    for op, va, vb, expected in cases:
+        ea, eb = ff.E(va), ff.E(vb)
+        got = ff.E_inv(ff.forward_cmp(ea, eb, op))
+        _check(
+            f"forward_cmp[{isa.OP_NAMES[op]}](va={va},vb={vb})",
+            got == expected,
+            f"got {got}, expect {expected}",
+        )
+
+
+def test_primitives_forward_eqz():
+    """forward_eqz(ea) returns E(1) iff va == 0, else E(0)."""
+    for v, expected in [(0, 1), (1, 0), (-5, 0), (100, 0)]:
+        got = ff.E_inv(ff.forward_eqz(ff.E(v)))
+        _check(f"forward_eqz({v})", got == expected, f"got {got}, expect {expected}")
+
+
+def test_primitives_cmp_matrix_shapes():
+    """M_CMP extracts diff (vb - va) via a 1×(2d) linear form; M_EQZ
+    extracts va via a 1×d linear form. Both carry the non-polynomial
+    gate at the dispatch boundary, not in their weight tensor."""
+    d = ff.D_MODEL
+    _check("M_CMP shape", ff.M_CMP.shape == (1, 2 * d))
+    _check("M_EQZ shape", ff.M_EQZ.shape == (1, d))
+
+    # M_CMP: ea contributes -1 at DIM_VALUE, eb contributes +1 at d+DIM_VALUE.
+    _check("M_CMP[0, DIM_VALUE] == -1",
+           float(ff.M_CMP[0, DIM_VALUE].item()) == -1.0)
+    _check("M_CMP[0, d+DIM_VALUE] == +1",
+           float(ff.M_CMP[0, d + DIM_VALUE].item()) == 1.0)
+    nonzero_cmp = (ff.M_CMP != 0).sum().item()
+    _check("M_CMP has exactly 2 nonzeros", nonzero_cmp == 2)
+
+    # M_EQZ: single +1 at DIM_VALUE.
+    _check("M_EQZ[0, DIM_VALUE] == 1",
+           float(ff.M_EQZ[0, DIM_VALUE].item()) == 1.0)
+    nonzero_eqz = (ff.M_EQZ != 0).sum().item()
+    _check("M_EQZ has exactly 1 nonzero", nonzero_eqz == 1)
+
+
+def test_symbolic_comparison_primitives():
+    """symbolic_cmp / symbolic_eqz return IndicatorPoly with the right
+    diff polynomial and relation tag."""
+    x0, x1 = Poly.variable(0), Poly.variable(1)
+
+    pairs = [
+        (isa.OP_LT_S, REL_LT),
+        (isa.OP_GT_S, REL_GT),
+        (isa.OP_LE_S, REL_LE),
+        (isa.OP_GE_S, REL_GE),
+        (isa.OP_EQ,   REL_EQ),
+        (isa.OP_NE,   REL_NE),
+    ]
+    for op, expected_rel in pairs:
+        # symbolic_cmp(pa, pb) — pa=top=x0, pb=SP-1=x1 → diff = pb - pa = x1 - x0.
+        ind = ff.symbolic_cmp(x0, x1, op)
+        _check(f"symbolic_cmp[{isa.OP_NAMES[op]}] type",
+               isinstance(ind, IndicatorPoly))
+        _check(f"symbolic_cmp[{isa.OP_NAMES[op]}] relation",
+               ind.relation == expected_rel,
+               f"got {ind.relation}, expect {expected_rel}")
+        _check(f"symbolic_cmp[{isa.OP_NAMES[op]}] poly",
+               ind.poly == (x1 - x0), f"got {ind.poly!r}")
+
+    ind_eqz = ff.symbolic_eqz(x0)
+    _check("symbolic_eqz type", isinstance(ind_eqz, IndicatorPoly))
+    _check("symbolic_eqz relation", ind_eqz.relation == REL_EQ)
+    _check("symbolic_eqz poly == x0", ind_eqz.poly == x0)
+
+
+def test_equivalence_comparison_structural():
+    """forward_symbolic on comparison programs produces the same
+    IndicatorPoly the symbolic executor emits. Structural equality on
+    both the underlying poly and the relation tag."""
+    model = CompiledModel()
+    ops = [isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
+           isa.OP_EQ, isa.OP_NE]
+    for op in ops:
+        prog = program(("PUSH", 3), ("PUSH", 5),
+                       (isa.OP_NAMES[op],), ("HALT",))
+        sym = run_symbolic(prog)
+        fs = model.forward_symbolic(prog)
+        _check(
+            f"cmp.struct.type[{isa.OP_NAMES[op]}]",
+            isinstance(sym.top, IndicatorPoly)
+            and isinstance(fs.top, IndicatorPoly),
+            f"sym={type(sym.top).__name__}, ff={type(fs.top).__name__}",
+        )
+        _check(
+            f"cmp.struct.poly[{isa.OP_NAMES[op]}]",
+            sym.top.poly == fs.top.poly,
+            f"sym.poly={sym.top.poly!r} ff.poly={fs.top.poly!r}",
+        )
+        _check(
+            f"cmp.struct.rel[{isa.OP_NAMES[op]}]",
+            sym.top.relation == fs.top.relation,
+            f"sym.rel={sym.top.relation} ff.rel={fs.top.relation}",
+        )
+
+
+def test_equivalence_eqz_structural():
+    """forward_symbolic on EQZ matches run_symbolic.top structurally."""
+    model = CompiledModel()
+    prog = program(("PUSH", 0), ("EQZ",), ("HALT",))
+    sym = run_symbolic(prog)
+    fs = model.forward_symbolic(prog)
+    _check("eqz.struct.type",
+           isinstance(sym.top, IndicatorPoly) and isinstance(fs.top, IndicatorPoly))
+    _check("eqz.struct.poly", sym.top.poly == fs.top.poly)
+    _check("eqz.struct.rel", sym.top.relation == fs.top.relation == REL_EQ)
+
+
+def test_equivalence_comparison_numeric():
+    """Three-way check: sym.eval_at == NumPy top == TorchExecutor top.
+
+    Covers the WASM convention (``LT_S`` returns ``1 if vb < va``) across
+    every signed comparison plus EQZ, on inputs spanning the comparison's
+    {<, =, >} (or {=0, ≠0}) regions.
+    """
+    from executor import TorchExecutor
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+    torch_exec = TorchExecutor(model)
+
+    binary_cases = [
+        (isa.OP_LT_S, (3, 5)), (isa.OP_LT_S, (5, 3)), (isa.OP_LT_S, (4, 4)),
+        (isa.OP_GT_S, (3, 5)), (isa.OP_LE_S, (4, 4)), (isa.OP_GE_S, (7, 2)),
+        (isa.OP_EQ,   (7, 7)), (isa.OP_NE,   (3, 5)),
+    ]
+    for op, (a, b) in binary_cases:
+        prog = [
+            isa.Instruction(isa.OP_PUSH, a),
+            isa.Instruction(isa.OP_PUSH, b),
+            isa.Instruction(op),
+            isa.Instruction(isa.OP_HALT),
+        ]
+        sym = run_symbolic(prog)
+        sym_val = sym.top.eval_at(sym.bindings)
+        np_top = np_exec.execute(prog).steps[-1].top
+        t_top = torch_exec.execute(prog).steps[-1].top
+        _check(
+            f"cmp.numeric[{isa.OP_NAMES[op]}({a},{b})]",
+            sym_val == np_top == t_top,
+            f"sym={sym_val} np={np_top} torch={t_top}",
+        )
+
+    for a in [-3, -1, 0, 1, 5]:
+        prog = [
+            isa.Instruction(isa.OP_PUSH, a),
+            isa.Instruction(isa.OP_EQZ),
+            isa.Instruction(isa.OP_HALT),
+        ]
+        sym = run_symbolic(prog)
+        sym_val = sym.top.eval_at(sym.bindings)
+        np_top = np_exec.execute(prog).steps[-1].top
+        t_top = torch_exec.execute(prog).steps[-1].top
+        _check(
+            f"eqz.numeric({a})",
+            sym_val == np_top == t_top,
+            f"sym={sym_val} np={np_top} torch={t_top}",
+        )
+
+
+def test_native_max_three_way_numeric():
+    """native_max demonstrates the full gated path end-to-end: GT_S →
+    IndicatorPoly → JZ hoists relation into Guard pair → GuardedPoly
+    dispatch. Symbolic eval, NumPy exec, and TorchExecutor must all agree
+    on the computed max at the catalog's concrete inputs."""
+    from executor import TorchExecutor
+    import programs as P
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+    torch_exec = TorchExecutor(model)
+
+    for a, b in [(3, 5), (7, 2), (4, 4)]:
+        prog, expected = P.make_native_max(a, b)
+        sym = run_forking(prog, input_mode="symbolic")
+        assert sym.top is not None
+        sym_val = sym.top.eval_at(sym.bindings)
+        np_top = np_exec.execute(prog).steps[-1].top
+        t_top = torch_exec.execute(prog).steps[-1].top
+        _check(
+            f"native_max.numeric({a},{b})",
+            sym_val == np_top == t_top == expected,
+            f"sym={sym_val} np={np_top} torch={t_top} expected={expected}",
+        )
+
+
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
 def test_blocked_opcodes():
@@ -640,6 +859,14 @@ def main():
         test_symbolic_rational_primitives,
         test_equivalence_rational,
         test_rational_catalog_rows_classify_as_collapsed,
+        test_primitives_forward_cmp,
+        test_primitives_forward_eqz,
+        test_primitives_cmp_matrix_shapes,
+        test_symbolic_comparison_primitives,
+        test_equivalence_comparison_structural,
+        test_equivalence_eqz_structural,
+        test_equivalence_comparison_numeric,
+        test_native_max_three_way_numeric,
         test_blocked_opcodes,
     ]
     print("=" * 60)
