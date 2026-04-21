@@ -56,7 +56,19 @@ from fractions import Fraction
 from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import isa
-from isa import _trunc_div, _trunc_rem
+from isa import (
+    _clz32,
+    _ctz32,
+    _popcnt32,
+    _rotl32,
+    _rotr32,
+    _shr_s,
+    _shr_u,
+    _to_i32,
+    _trunc_div,
+    _trunc_rem,
+    MASK32,
+)
 
 
 # ─── Poly ──────────────────────────────────────────────────────────
@@ -309,7 +321,7 @@ def _relation_holds(rel: str, value: Union[int, Fraction]) -> bool:
 
 @dataclass(frozen=True)
 class IndicatorPoly:
-    """Sign indicator on a polynomial: ``1 if poly REL 0 else 0``.
+    """Sign indicator on a polynomial / bit-vector: ``1 if poly REL 0 else 0``.
 
     Carries a comparison's symbolic result through the stack without
     leaving the polynomial ring at the *expression* level — the gate
@@ -319,11 +331,17 @@ class IndicatorPoly:
     operand directly for EQZ; ``relation`` is one of
     ``REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE``.
 
+    Issue #77 widened ``poly`` to the :class:`SymbolicIntAst` union so
+    comparisons against a :class:`BitVec` (``is_power_of_2``'s
+    ``POPCNT; PUSH 1; EQ``) land here rather than raising. The BitVec
+    gets evaluated to a concrete int at :meth:`eval_at`; the relation
+    is then applied identically.
+
     Composition past an :class:`IndicatorPoly` (e.g. another ADD) is
     out of scope for issue #76 — the consuming op raises
     :class:`SymbolicOpNotSupported`, matching the rational story.
     """
-    poly: Poly
+    poly: Union[Poly, "BitVec"]
     relation: str
 
     def __post_init__(self):
@@ -435,11 +453,198 @@ class SymbolicRemainder:
         return f"({self.num}) %ₜ ({self.denom})"
 
 
+# ─── Bit-vector AST (issue #77) ────────────────────────────────────
+#
+# Bitwise ops (AND/OR/XOR/SHL/SHR_S/SHR_U/CLZ/CTZ/POPCNT) are not
+# polynomial over ℤ: AND/OR/XOR need (ℤ/2ℤ)[bits] to close, shifts need
+# an exponent-lookup path for the shift amount, and CLZ/CTZ/POPCNT are
+# piecewise. Instead of forcing them into the Poly ring, we carry a
+# lightweight :class:`BitVec` AST through the stack — same boundary-step
+# pattern :class:`RationalPoly` / :class:`IndicatorPoly` already use for
+# DIV_S/REM_S (issue #75) and comparisons (issue #76).
+#
+# The AST is recursive: ``BitVec("AND", (poly_1, BitVec("SHR_U", (k, n))))``
+# is the ``bit_extract(n, k)`` program's top, composing one bit op inside
+# another. ``eval_at`` walks the tree bottom-up, applying the named op
+# (``_apply_bitop``) at each node — the non-polynomial leaves live there,
+# exactly on par with ``_trunc_div`` (DIV_S) and ``_relation_holds``
+# (comparisons).
+#
+# ADD/SUB/MUL composed with a :class:`BitVec` operand (the ``log2_floor``
+# case: ``SUB(31, CLZ(n))``) lift the arithmetic into the AST by encoding
+# it as a ``BitVec("ADD"/"SUB"/"MUL", ...)`` node. This is the
+# minimum-disruption way to cover the catalog's hybrid-arithmetic-and-bit
+# programs without widening Poly itself.
+
+
+_BIT_BINARY_OPS = {"AND", "OR", "XOR", "SHL", "SHR_S", "SHR_U", "ROTL", "ROTR"}
+_BIT_UNARY_OPS = {"CLZ", "CTZ", "POPCNT"}
+# Arithmetic lifted into the BitVec AST when one operand is already a BitVec
+# (log2_floor's ``SUB(31, CLZ(n))`` case). Kept distinct from the bit ops
+# so ``_apply_bitop`` can dispatch cleanly.
+_BIT_ARITH_OPS = {"ADD", "SUB", "MUL"}
+_BIT_OPS = _BIT_BINARY_OPS | _BIT_UNARY_OPS | _BIT_ARITH_OPS
+
+
+def _apply_bitop(op: str, values: List[int]) -> int:
+    """Apply a named bit / lifted-arithmetic op to concrete integer operands.
+
+    The boundary nonlinearity for :class:`BitVec` nodes. ``values`` are
+    the already-evaluated operand integers, in *natural* left-to-right
+    reading order: for binary ops ``[left, right] = [SP-1, top]``, so the
+    expression reads as ``left OP right`` (e.g. ``SUB`` is
+    ``left − right`` = ``SP-1 − top`` = WASM ``i32.sub``'s ``vb − va``).
+    Returns the i32-wrapped integer result.
+
+    The named arithmetic ops (``ADD``, ``SUB``, ``MUL``) are here rather
+    than in :class:`Poly` because they're used only when at least one
+    operand is a :class:`BitVec` — the Poly-closed path never constructs
+    them. Matches ``executor.py`` semantics.
+    """
+    if op == "AND":
+        left, right = values
+        return _to_i32(left) & _to_i32(right)
+    if op == "OR":
+        left, right = values
+        return _to_i32(left) | _to_i32(right)
+    if op == "XOR":
+        left, right = values
+        return _to_i32(left) ^ _to_i32(right)
+    if op == "SHL":
+        left, right = values
+        return (_to_i32(left) << (int(right) & 31)) & MASK32
+    if op == "SHR_S":
+        left, right = values
+        return _shr_s(left, right)
+    if op == "SHR_U":
+        left, right = values
+        return _shr_u(left, right)
+    if op == "ROTL":
+        left, right = values
+        return _rotl32(left, right)
+    if op == "ROTR":
+        left, right = values
+        return _rotr32(left, right)
+    if op == "CLZ":
+        (v,) = values
+        return _clz32(v)
+    if op == "CTZ":
+        (v,) = values
+        return _ctz32(v)
+    if op == "POPCNT":
+        (v,) = values
+        return _popcnt32(v)
+    if op == "ADD":
+        left, right = values
+        return (int(left) + int(right)) & MASK32
+    if op == "SUB":
+        left, right = values
+        return (int(left) - int(right)) & MASK32
+    if op == "MUL":
+        left, right = values
+        return (int(left) * int(right)) & MASK32
+    raise ValueError(f"unknown bit/arith op {op!r}")
+
+
+# Display symbol for each op — used by :meth:`BitVec.__repr__`.
+_BITVEC_DISPLAY = {
+    "AND": "&", "OR": "|", "XOR": "^",
+    "SHL": "<<", "SHR_S": ">>ₛ", "SHR_U": ">>ᵤ",
+    "ROTL": "rotl", "ROTR": "rotr",
+    "CLZ": "clz", "CTZ": "ctz", "POPCNT": "popcnt",
+    "ADD": "+", "SUB": "-", "MUL": "·",
+}
+
+
+@dataclass(frozen=True)
+class BitVec:
+    """Symbolic i32 value from the bit-vector fragment (issue #77).
+
+    Stored as an AST node with a named op and a tuple of operands. Each
+    operand is a :class:`Poly` (a literal or variable) or another
+    :class:`BitVec` (nested composition, like ``bit_extract``'s ``AND(1,
+    SHR_U(k, n))`` top).
+
+    The AST is never simplified — two ``BitVec("AND", (x, x))`` nodes compare
+    equal, but they are not auto-rewritten to ``x``. A ring-level algebra
+    over ``(ℤ/2ℤ)[bits]`` would let ``AND`` / ``OR`` / ``XOR`` cancel and
+    absorb; that's a follow-up, not required to unblock the catalog's
+    bitwise rows.
+
+    :meth:`eval_at` is the boundary step: it evaluates each operand to a
+    concrete int and then applies :func:`_apply_bitop`. The non-polynomial
+    computation fires only at that boundary, matching the
+    :class:`RationalPoly` / :class:`IndicatorPoly` design.
+
+    :attr:`op` is one of the strings in :data:`_BIT_OPS` — the binary bit
+    ops ``AND / OR / XOR / SHL / SHR_S / SHR_U / ROTL / ROTR``, the unary
+    counters ``CLZ / CTZ / POPCNT``, or a *lifted* arithmetic op
+    ``ADD / SUB / MUL`` (see module docstring for why arithmetic with a
+    :class:`BitVec` operand lands here rather than widening :class:`Poly`).
+    """
+
+    op: str
+    operands: Tuple[Union[Poly, "BitVec"], ...]
+
+    def __post_init__(self):
+        if self.op not in _BIT_OPS:
+            raise ValueError(
+                f"BitVec.op must be one of {sorted(_BIT_OPS)}, got {self.op!r}"
+            )
+        if self.op in _BIT_BINARY_OPS or self.op in _BIT_ARITH_OPS:
+            expected = 2
+        else:
+            expected = 1
+        if len(self.operands) != expected:
+            raise ValueError(
+                f"BitVec({self.op!r}) expects {expected} operand(s), "
+                f"got {len(self.operands)}"
+            )
+        for o in self.operands:
+            if not isinstance(o, (Poly, BitVec)):
+                raise TypeError(
+                    f"BitVec operand must be Poly or BitVec, got {type(o).__name__}"
+                )
+
+    def variables(self) -> List[int]:
+        seen = set()
+        for o in self.operands:
+            seen.update(o.variables())
+        return sorted(seen)
+
+    def eval_at(self, bindings: Mapping[int, int]) -> int:
+        """Evaluate the AST at concrete bindings. Recursively reduces
+        each operand to an int and applies :func:`_apply_bitop`.
+        """
+        vals = [int(o.eval_at(bindings)) for o in self.operands]
+        return _apply_bitop(self.op, vals)
+
+    def __repr__(self) -> str:
+        sym = _BITVEC_DISPLAY.get(self.op, self.op)
+        if self.op in _BIT_UNARY_OPS:
+            return f"{sym}({self.operands[0]})"
+        a, b = self.operands
+        return f"({a} {sym} {b})"
+
+
 # Union covering every "top of symbolic stack" type run_symbolic /
 # run_forking might emit for a branchless polynomial-plus-rational-plus-
 # indicator program. Issue #76 added :class:`IndicatorPoly` to carry
 # comparison results (EQ/NE/LT_S/GT_S/LE_S/GE_S/EQZ) through the stack.
-RationalStackValue = Union[Poly, RationalPoly, SymbolicRemainder, IndicatorPoly]
+# Issue #77 adds :class:`BitVec` for the bit-vector fragment (AND, OR,
+# XOR, SHL, SHR_S, SHR_U, CLZ, CTZ, POPCNT).
+RationalStackValue = Union[
+    Poly, RationalPoly, SymbolicRemainder, IndicatorPoly, BitVec,
+]
+
+# "Int-valued AST" — any symbolic type that evaluates to an i32 integer
+# at ``eval_at``. Used by the hybrid arithmetic hook (issue #77): ``ADD``
+# / ``SUB`` / ``MUL`` on a :class:`BitVec` operand lifts the whole
+# expression into the :class:`BitVec` AST rather than widening
+# :class:`Poly`. The comparison primitives similarly accept any
+# :class:`SymbolicIntAst` so ``is_power_of_2`` (``POPCNT; PUSH 1; EQ``)
+# collapses cleanly.
+SymbolicIntAst = Union[Poly, BitVec]
 
 
 # ─── Guard + GuardedPoly ──────────────────────────────────────────
@@ -620,12 +825,19 @@ _BIN_OP_RELATION = {
     isa.OP_GE_S: REL_GE,
 }
 
+_BIT_BIN_OPS = {
+    isa.OP_AND, isa.OP_OR, isa.OP_XOR,
+    isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U,
+}
+_BIT_UN_OPS = {isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT}
+_BITVEC_OPCODES = _BIT_BIN_OPS | _BIT_UN_OPS
+
 _POLY_OPS = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
-} | _CMP_OPS
+} | _CMP_OPS | _BITVEC_OPCODES
 # Branch ops the forking executor additionally handles.
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
 # Union: what run_forking accepts.
@@ -740,28 +952,49 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
             stack.append(stack[-1])
         elif op == isa.OP_ADD:
             b = _pop(); a = _pop()
-            if not isinstance(a, Poly) or not isinstance(b, Poly):
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                    raise SymbolicOpNotSupported(
+                        "ADD mixing BitVec with rational/indicator entries is out of scope"
+                    )
+                stack.append(BitVec(op="ADD", operands=(a, b)))
+            elif not isinstance(a, Poly) or not isinstance(b, Poly):
                 raise SymbolicOpNotSupported(
                     "ADD on rational stack entries is out of scope "
                     "(composition past one DIV_S/REM_S is a follow-up)"
                 )
-            stack.append(a + b)
+            else:
+                stack.append(a + b)
         elif op == isa.OP_SUB:
             b = _pop(); a = _pop()
-            if not isinstance(a, Poly) or not isinstance(b, Poly):
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                    raise SymbolicOpNotSupported(
+                        "SUB mixing BitVec with rational/indicator entries is out of scope"
+                    )
+                stack.append(BitVec(op="SUB", operands=(a, b)))
+            elif not isinstance(a, Poly) or not isinstance(b, Poly):
                 raise SymbolicOpNotSupported(
                     "SUB on rational stack entries is out of scope "
                     "(composition past one DIV_S/REM_S is a follow-up)"
                 )
-            stack.append(a - b)
+            else:
+                stack.append(a - b)
         elif op == isa.OP_MUL:
             b = _pop(); a = _pop()
-            if not isinstance(a, Poly) or not isinstance(b, Poly):
+            if isinstance(a, BitVec) or isinstance(b, BitVec):
+                if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                    raise SymbolicOpNotSupported(
+                        "MUL mixing BitVec with rational/indicator entries is out of scope"
+                    )
+                stack.append(BitVec(op="MUL", operands=(a, b)))
+            elif not isinstance(a, Poly) or not isinstance(b, Poly):
                 raise SymbolicOpNotSupported(
                     "MUL on rational stack entries is out of scope "
                     "(composition past one DIV_S/REM_S is a follow-up)"
                 )
-            stack.append(a * b)
+            else:
+                stack.append(a * b)
         elif op == isa.OP_DIV_S:
             b = _pop(); a = _pop()
             if not isinstance(a, Poly) or not isinstance(b, Poly):
@@ -780,23 +1013,37 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
             stack.append(SymbolicRemainder(num=a, denom=b))
         elif op in _CMP_BIN_OPS:
             b = _pop(); a = _pop()
-            if not isinstance(a, Poly) or not isinstance(b, Poly):
+            # WASM convention: ``a = stack[SP-1]`` (vb), ``b = top`` (va).
+            # For Poly operands, wrap the difference as a Poly; for a
+            # BitVec operand (``is_power_of_2``'s ``POPCNT; PUSH 1; EQ``)
+            # lift the difference into the BitVec AST so the indicator can
+            # still evaluate to {0, 1} at the boundary.
+            if isinstance(a, Poly) and isinstance(b, Poly):
+                stack.append(IndicatorPoly(poly=a - b,
+                                           relation=_BIN_OP_RELATION[op]))
+            elif isinstance(a, (Poly, BitVec)) and isinstance(b, (Poly, BitVec)):
+                # Matches the Poly path's ``a - b`` = ``SP-1 - top``; the
+                # relation table maps each opcode to the right comparison
+                # against zero on that difference.
+                stack.append(IndicatorPoly(
+                    poly=BitVec(op="SUB", operands=(a, b)),
+                    relation=_BIN_OP_RELATION[op],
+                ))
+            else:
                 raise SymbolicOpNotSupported(
                     f"{isa.OP_NAMES[op]} on non-Poly stack entries is out "
                     "of scope (composition past one DIV_S/REM_S/comparison "
                     "is a follow-up)"
                 )
-            # WASM convention: ``a = stack[SP-1]`` (vb), ``b = top`` (va).
-            # The relation table maps each op to ``vb REL va`` ⇔ ``a - b REL 0``.
-            stack.append(IndicatorPoly(poly=a - b, relation=_BIN_OP_RELATION[op]))
         elif op == isa.OP_EQZ:
             a = _pop()
-            if not isinstance(a, Poly):
+            if isinstance(a, (Poly, BitVec)):
+                stack.append(IndicatorPoly(poly=a, relation=REL_EQ))
+            else:
                 raise SymbolicOpNotSupported(
                     "EQZ on non-Poly stack entries is out of scope "
                     "(composition past one DIV_S/REM_S/comparison is a follow-up)"
                 )
-            stack.append(IndicatorPoly(poly=a, relation=REL_EQ))
         elif op == isa.OP_SWAP:
             if len(stack) < 2:
                 raise SymbolicStackUnderflow("swap needs 2 entries")
@@ -811,6 +1058,22 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
             # [a, b, c] -> [b, c, a] (matches test_algorithm semantics)
             a, b, c = stack[-3], stack[-2], stack[-1]
             stack[-3], stack[-2], stack[-1] = b, c, a
+        elif op in _BIT_BIN_OPS:
+            # Binary bit op: ``a = SP-1``, ``b = top``. BitVec wraps each
+            # operand verbatim (no simplification) — see module docstring.
+            b = _pop(); a = _pop()
+            if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                raise SymbolicOpNotSupported(
+                    f"{isa.OP_NAMES[op]} on rational/indicator entries is out of scope"
+                )
+            stack.append(BitVec(op=isa.OP_NAMES[op], operands=(a, b)))
+        elif op in _BIT_UN_OPS:
+            a = _pop()
+            if not isinstance(a, (Poly, BitVec)):
+                raise SymbolicOpNotSupported(
+                    f"{isa.OP_NAMES[op]} on rational/indicator entries is out of scope"
+                )
+            stack.append(BitVec(op=isa.OP_NAMES[op], operands=(a,)))
         else:  # pragma: no cover — guarded by _POLY_OPS
             raise SymbolicOpNotSupported(f"unreachable: op {op}")
 
@@ -839,6 +1102,17 @@ DivFn = Callable[["Poly", "Poly"], "RationalPoly"]
 RemFn = Callable[["Poly", "Poly"], "SymbolicRemainder"]
 CmpBinFn = Callable[["Poly", "Poly"], "IndicatorPoly"]
 CmpUnaryFn = Callable[["Poly"], "IndicatorPoly"]
+# Issue #77: bit-vector primitives. Binary bit ops take
+# ``(a, b) = (SP-1, top)`` (matching the arithmetic convention), each
+# operand may already be a :class:`BitVec` (nested bit programs) or a
+# plain :class:`Poly` (fresh values). Unary ops take a single
+# :class:`SymbolicIntAst` operand. Hybrid-arithmetic ops
+# (:data:`ArithmeticOps.bit_add` etc.) are invoked when at least one side
+# is a :class:`BitVec` and take the same argument shape as ``ArithFn``,
+# except they accept :class:`SymbolicIntAst` and return :class:`BitVec`.
+BitBinFn = Callable[["SymbolicIntAst", "SymbolicIntAst"], "BitVec"]
+BitUnaryFn = Callable[["SymbolicIntAst"], "BitVec"]
+BitArithFn = Callable[["SymbolicIntAst", "SymbolicIntAst"], "BitVec"]
 
 
 @dataclass(frozen=True)
@@ -875,6 +1149,23 @@ class ArithmeticOps:
     cmp_le_s: CmpBinFn = None  # type: ignore[assignment]
     cmp_ge_s: CmpBinFn = None  # type: ignore[assignment]
     eqz: CmpUnaryFn = None  # type: ignore[assignment]
+    # Issue #77: bit-vector primitives. The default (Poly-ring) path
+    # builds :class:`BitVec` AST nodes; :mod:`ff_symbolic` overrides with
+    # bilinear-FF versions that still produce :class:`BitVec` tops but
+    # with values threaded through the residual stream.
+    bit_and: BitBinFn = None  # type: ignore[assignment]
+    bit_or: BitBinFn = None  # type: ignore[assignment]
+    bit_xor: BitBinFn = None  # type: ignore[assignment]
+    bit_shl: BitBinFn = None  # type: ignore[assignment]
+    bit_shr_s: BitBinFn = None  # type: ignore[assignment]
+    bit_shr_u: BitBinFn = None  # type: ignore[assignment]
+    bit_clz: BitUnaryFn = None  # type: ignore[assignment]
+    bit_ctz: BitUnaryFn = None  # type: ignore[assignment]
+    bit_popcnt: BitUnaryFn = None  # type: ignore[assignment]
+    # Lifted arithmetic for BitVec ⟷ Poly mixed operands (log2_floor case).
+    bit_add: BitArithFn = None  # type: ignore[assignment]
+    bit_sub: BitArithFn = None  # type: ignore[assignment]
+    bit_mul: BitArithFn = None  # type: ignore[assignment]
 
     def cmp(self, op: int) -> Optional[CmpBinFn]:
         """Resolve an OP_* opcode to the matching binary-cmp primitive.
@@ -891,6 +1182,34 @@ class ArithmeticOps:
             isa.OP_GE_S: self.cmp_ge_s,
         }.get(op)
 
+    def bit_binary(self, op: int) -> Optional[BitBinFn]:
+        """Resolve an OP_* opcode to the matching binary bit primitive.
+
+        Covers AND/OR/XOR/SHL/SHR_S/SHR_U. ROTL/ROTR aren't in the
+        issue-#77 catalog scope but are representable via the same
+        :class:`BitVec` AST if a future row needs them. Returns ``None``
+        when the primitive isn't wired.
+        """
+        return {
+            isa.OP_AND: self.bit_and,
+            isa.OP_OR: self.bit_or,
+            isa.OP_XOR: self.bit_xor,
+            isa.OP_SHL: self.bit_shl,
+            isa.OP_SHR_S: self.bit_shr_s,
+            isa.OP_SHR_U: self.bit_shr_u,
+        }.get(op)
+
+    def bit_unary(self, op: int) -> Optional[BitUnaryFn]:
+        """Resolve an OP_* opcode to the matching unary bit primitive.
+
+        Covers CLZ / CTZ / POPCNT. Returns ``None`` when unwired.
+        """
+        return {
+            isa.OP_CLZ: self.bit_clz,
+            isa.OP_CTZ: self.bit_ctz,
+            isa.OP_POPCNT: self.bit_popcnt,
+        }.get(op)
+
 
 DEFAULT_ARITHMETIC_OPS = ArithmeticOps(
     add=lambda a, b: a + b,
@@ -905,6 +1224,18 @@ DEFAULT_ARITHMETIC_OPS = ArithmeticOps(
     cmp_le_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_LE),
     cmp_ge_s=lambda a, b: IndicatorPoly(poly=a - b, relation=REL_GE),
     eqz=lambda a: IndicatorPoly(poly=a, relation=REL_EQ),
+    bit_and=lambda a, b: BitVec(op="AND", operands=(a, b)),
+    bit_or=lambda a, b: BitVec(op="OR", operands=(a, b)),
+    bit_xor=lambda a, b: BitVec(op="XOR", operands=(a, b)),
+    bit_shl=lambda a, b: BitVec(op="SHL", operands=(a, b)),
+    bit_shr_s=lambda a, b: BitVec(op="SHR_S", operands=(a, b)),
+    bit_shr_u=lambda a, b: BitVec(op="SHR_U", operands=(a, b)),
+    bit_clz=lambda a: BitVec(op="CLZ", operands=(a,)),
+    bit_ctz=lambda a: BitVec(op="CTZ", operands=(a,)),
+    bit_popcnt=lambda a: BitVec(op="POPCNT", operands=(a,)),
+    bit_add=lambda a, b: BitVec(op="ADD", operands=(a, b)),
+    bit_sub=lambda a, b: BitVec(op="SUB", operands=(a, b)),
+    bit_mul=lambda a, b: BitVec(op="MUL", operands=(a, b)),
 )
 
 
@@ -1309,28 +1640,61 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
         stack.append(stack[-1])
     elif op == isa.OP_ADD:
         b = _pop(); a = _pop()
-        if not isinstance(a, Poly) or not isinstance(b, Poly):
+        if isinstance(a, BitVec) or isinstance(b, BitVec):
+            if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                raise SymbolicOpNotSupported(
+                    "ADD mixing BitVec with rational/indicator entries is out of scope"
+                )
+            if arithmetic_ops.bit_add is None:
+                raise SymbolicOpNotSupported(
+                    "arithmetic_ops.bit_add is not wired; pass a bit_add primitive"
+                )
+            stack.append(arithmetic_ops.bit_add(a, b))
+        elif not isinstance(a, Poly) or not isinstance(b, Poly):
             raise SymbolicOpNotSupported(
                 "ADD on rational stack entries is out of scope "
                 "(composition past one DIV_S/REM_S is a follow-up)"
             )
-        stack.append(arithmetic_ops.add(a, b))
+        else:
+            stack.append(arithmetic_ops.add(a, b))
     elif op == isa.OP_SUB:
         b = _pop(); a = _pop()
-        if not isinstance(a, Poly) or not isinstance(b, Poly):
+        if isinstance(a, BitVec) or isinstance(b, BitVec):
+            if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                raise SymbolicOpNotSupported(
+                    "SUB mixing BitVec with rational/indicator entries is out of scope"
+                )
+            if arithmetic_ops.bit_sub is None:
+                raise SymbolicOpNotSupported(
+                    "arithmetic_ops.bit_sub is not wired; pass a bit_sub primitive"
+                )
+            stack.append(arithmetic_ops.bit_sub(a, b))
+        elif not isinstance(a, Poly) or not isinstance(b, Poly):
             raise SymbolicOpNotSupported(
                 "SUB on rational stack entries is out of scope "
                 "(composition past one DIV_S/REM_S is a follow-up)"
             )
-        stack.append(arithmetic_ops.sub(a, b))
+        else:
+            stack.append(arithmetic_ops.sub(a, b))
     elif op == isa.OP_MUL:
         b = _pop(); a = _pop()
-        if not isinstance(a, Poly) or not isinstance(b, Poly):
+        if isinstance(a, BitVec) or isinstance(b, BitVec):
+            if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+                raise SymbolicOpNotSupported(
+                    "MUL mixing BitVec with rational/indicator entries is out of scope"
+                )
+            if arithmetic_ops.bit_mul is None:
+                raise SymbolicOpNotSupported(
+                    "arithmetic_ops.bit_mul is not wired; pass a bit_mul primitive"
+                )
+            stack.append(arithmetic_ops.bit_mul(a, b))
+        elif not isinstance(a, Poly) or not isinstance(b, Poly):
             raise SymbolicOpNotSupported(
                 "MUL on rational stack entries is out of scope "
                 "(composition past one DIV_S/REM_S is a follow-up)"
             )
-        stack.append(arithmetic_ops.mul(a, b))
+        else:
+            stack.append(arithmetic_ops.mul(a, b))
     elif op == isa.OP_DIV_S:
         b = _pop(); a = _pop()
         if not isinstance(a, Poly) or not isinstance(b, Poly):
@@ -1357,30 +1721,41 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
         stack.append(arithmetic_ops.rem_s(a, b))
     elif op in _CMP_BIN_OPS:
         b = _pop(); a = _pop()
-        if not isinstance(a, Poly) or not isinstance(b, Poly):
+        if isinstance(a, Poly) and isinstance(b, Poly):
+            cmp_fn = arithmetic_ops.cmp(op)
+            if cmp_fn is None:
+                raise SymbolicOpNotSupported(
+                    f"arithmetic_ops.cmp({isa.OP_NAMES[op]}) is not wired"
+                )
+            stack.append(cmp_fn(a, b))
+        elif isinstance(a, (Poly, BitVec)) and isinstance(b, (Poly, BitVec)):
+            # is_power_of_2 composes POPCNT (BitVec) with PUSH 1 (Poly).
+            # Matches the Poly path's ``a - b`` = ``SP-1 - top`` difference.
+            stack.append(IndicatorPoly(
+                poly=BitVec(op="SUB", operands=(a, b)),
+                relation=_BIN_OP_RELATION[op],
+            ))
+        else:
             raise SymbolicOpNotSupported(
                 f"{isa.OP_NAMES[op]} on non-Poly stack entries is out "
                 "of scope (composition past one DIV_S/REM_S/comparison "
                 "is a follow-up)"
             )
-        cmp_fn = arithmetic_ops.cmp(op)
-        if cmp_fn is None:
-            raise SymbolicOpNotSupported(
-                f"arithmetic_ops.cmp({isa.OP_NAMES[op]}) is not wired"
-            )
-        stack.append(cmp_fn(a, b))
     elif op == isa.OP_EQZ:
         a = _pop()
-        if not isinstance(a, Poly):
+        if isinstance(a, Poly):
+            if arithmetic_ops.eqz is None:
+                raise SymbolicOpNotSupported(
+                    "arithmetic_ops.eqz is not wired; pass an eqz primitive"
+                )
+            stack.append(arithmetic_ops.eqz(a))
+        elif isinstance(a, BitVec):
+            stack.append(IndicatorPoly(poly=a, relation=REL_EQ))
+        else:
             raise SymbolicOpNotSupported(
                 "EQZ on non-Poly stack entries is out of scope "
                 "(composition past one DIV_S/REM_S/comparison is a follow-up)"
             )
-        if arithmetic_ops.eqz is None:
-            raise SymbolicOpNotSupported(
-                "arithmetic_ops.eqz is not wired; pass an eqz primitive"
-            )
-        stack.append(arithmetic_ops.eqz(a))
     elif op == isa.OP_SWAP:
         if len(stack) < 2:
             raise SymbolicStackUnderflow(f"swap needs 2 entries at pc={path.pc}")
@@ -1394,6 +1769,30 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
             raise SymbolicStackUnderflow(f"rot needs 3 entries at pc={path.pc}")
         a, b, c = stack[-3], stack[-2], stack[-1]
         stack[-3], stack[-2], stack[-1] = b, c, a
+    elif op in _BIT_BIN_OPS:
+        b = _pop(); a = _pop()
+        if not isinstance(a, (Poly, BitVec)) or not isinstance(b, (Poly, BitVec)):
+            raise SymbolicOpNotSupported(
+                f"{isa.OP_NAMES[op]} on rational/indicator entries is out of scope"
+            )
+        bit_fn = arithmetic_ops.bit_binary(op)
+        if bit_fn is None:
+            raise SymbolicOpNotSupported(
+                f"arithmetic_ops.bit_binary({isa.OP_NAMES[op]}) is not wired"
+            )
+        stack.append(bit_fn(a, b))
+    elif op in _BIT_UN_OPS:
+        a = _pop()
+        if not isinstance(a, (Poly, BitVec)):
+            raise SymbolicOpNotSupported(
+                f"{isa.OP_NAMES[op]} on rational/indicator entries is out of scope"
+            )
+        bit_fn = arithmetic_ops.bit_unary(op)
+        if bit_fn is None:
+            raise SymbolicOpNotSupported(
+                f"arithmetic_ops.bit_unary({isa.OP_NAMES[op]}) is not wired"
+            )
+        stack.append(bit_fn(a))
     elif op == isa.OP_NOP:
         pass
     else:  # pragma: no cover
@@ -1452,6 +1851,8 @@ __all__ = [
     "RationalPoly",
     "SymbolicRemainder",
     "IndicatorPoly",
+    "BitVec",
+    "SymbolicIntAst",
     "Guard",
     "GuardedPoly",
     "SymbolicResult",

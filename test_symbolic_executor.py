@@ -151,15 +151,16 @@ def test_nop_preserves_stack():
 
 
 def test_unsupported_op_raises():
-    # AND remains outside _POLY_OPS (bitwise — not rational-algebraic).
-    # DIV_S / REM_S are in scope per issue #75.
-    prog = program(("PUSH", 12), ("PUSH", 10), ("AND",), ("HALT",))
+    # ROTL remains outside _POLY_OPS: issue #77 adds AND/OR/XOR/SHL/SHR_S/
+    # SHR_U/CLZ/CTZ/POPCNT but leaves ROTL/ROTR as follow-ups. DIV_S /
+    # REM_S / comparisons / bit ops in scope per #75 / #76 / #77.
+    prog = program(("PUSH", 5), ("PUSH", 1), ("ROTL",), ("HALT",))
     try:
         run_symbolic(prog)
     except SymbolicOpNotSupported as e:
-        assert "AND" in str(e)
+        assert "ROTL" in str(e)
     else:
-        raise AssertionError("expected SymbolicOpNotSupported for AND")
+        raise AssertionError("expected SymbolicOpNotSupported for ROTL")
 
 
 def test_div_s_composition_raises():
