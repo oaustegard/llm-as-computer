@@ -440,25 +440,30 @@ def test_sum_of_squares_pin():
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
 def test_blocked_opcodes():
-    """Ops outside the ADD/SUB/MUL fragment raise BlockedOpcodeForSymbolic.
+    """Ops outside the fragment raise BlockedOpcodeForSymbolic.
 
-    The issue's scope is explicit: DIV_S / REM_S / comparisons / bitwise
-    are non-goals. forward_symbolic refuses them rather than returning a
-    wrong answer.
+    Post issue #75 the fragment is ADD/SUB/MUL/DIV_S/REM_S + stack manip;
+    comparisons, bitwise, control-flow-within-branchless, and arithmetic
+    composition past a rational stack entry remain non-goals.
     """
     model = CompiledModel()
 
-    # DIV_S: not polynomial-closed.
-    prog = program(("PUSH", 10), ("PUSH", 3), ("DIV_S",), ("HALT",))
+    # Arithmetic composition past a rational stack entry — DIV_S then ADD.
+    # DIV_S is in scope, but ADD on the resulting RationalPoly is not.
+    prog = program(
+        ("PUSH", 10), ("PUSH", 3), ("DIV_S",),
+        ("PUSH", 1), ("ADD",), ("HALT",),
+    )
     try:
         model.forward_symbolic(prog)
-        _fail("blocked[DIV_S]", "expected BlockedOpcodeForSymbolic")
+        _fail("blocked[compose-past-DIV_S]", "expected BlockedOpcodeForSymbolic")
     except ff.BlockedOpcodeForSymbolic:
-        _pass("blocked[DIV_S]")
+        _pass("blocked[compose-past-DIV_S]")
     except Exception as e:
-        _fail("blocked[DIV_S]", f"wrong exception: {type(e).__name__}: {e}")
+        _fail("blocked[compose-past-DIV_S]",
+              f"wrong exception: {type(e).__name__}: {e}")
 
-    # JZ: control flow, not this issue's scope.
+    # JZ: control flow, not this issue's scope (in straight-line forward).
     prog = program(("PUSH", 1), ("JZ", 10), ("HALT",))
     try:
         model.forward_symbolic(prog)

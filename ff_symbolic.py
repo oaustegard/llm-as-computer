@@ -46,11 +46,34 @@ for continuity with :class:`executor.NumPyExecutor` (so
 ``test_consolidated.py`` stays green); the equivalence tests compare
 unmasked values on in-range inputs.
 
+Rational extension (issue #75)
+------------------------------
+DIV_S / REM_S are *not* polynomial. The workaround — and the content of
+issue #75 — is to keep the symbolic form rational (``RationalPoly`` /
+``SymbolicRemainder`` track ``(num, denom)`` pairs through the stack)
+and apply integer truncation only at the boundary, during
+``eval_at`` / ``forward_div_s`` evaluation.
+
+The "weight matrix" story for DIV_S / REM_S is therefore weaker than
+for ADD/SUB/MUL: ``M_DIV_S`` / ``M_REM_S`` are 2×2 *pair-selector*
+matrices that pluck the two scalar operands out of the stacked input,
+and the truncating division ``_trunc_div(vb, va)`` is a non-linear
+boundary step — not itself a matmul. That is the honest cost of
+integer-rounded division in a polynomial framework; the value of this
+extension is that the rational *algebra* (up to truncation) does
+compose cleanly, and the catalog's ``native_divmod`` / ``native_remainder``
+programs now have a closed-form symbolic top.
+
+Composition past a single DIV_S / REM_S on the same stack slot is not
+supported in this issue — a subsequent arithmetic op on a rational
+stack entry raises ``SymbolicOpNotSupported``. That is a follow-up.
+
 Scope
 -----
-This module handles ADD/SUB/MUL only. DIV_S, REM_S, comparisons,
-bitwise, unary numeric ops, control flow — all unchanged, and all
-explicit follow-ups per the issue's "Non-goals" section.
+ADD/SUB/MUL via true (bi)linear forms; DIV_S/REM_S via pair-selector
++ boundary trunc (issue #75). Comparisons, bitwise, unary numeric
+ops, control flow — all unchanged, and all explicit follow-ups per
+the issue's "Non-goals" section.
 """
 
 from __future__ import annotations
@@ -61,11 +84,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 
 import isa
-from isa import DIM_VALUE, D_MODEL, DTYPE
+from isa import DIM_VALUE, D_MODEL, DTYPE, _trunc_div, _trunc_rem
 from symbolic_executor import (
     ArithmeticOps,
     ForkingResult,
     Poly,
+    RationalPoly,
+    RationalStackValue,
+    SymbolicRemainder,
     run_forking,
 )
 
@@ -176,21 +202,49 @@ def _B_MUL_matrix(d_model: int = D_MODEL) -> torch.Tensor:
     return B
 
 
+def _M_DIV_S_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Pair-selector for DIV_S: pluck ``(va, vb)`` from ``[E(a); E(b)]``.
+
+    Shape: ``(2, 2*d_model)``. Row 0 picks ``va = ea[DIM_VALUE]`` (the top),
+    row 1 picks ``vb = eb[DIM_VALUE]`` (stack[SP-1]). The subsequent
+    ``_trunc_div(vb, va)`` is a *non-linear boundary step* — unlike
+    ``M_ADD`` / ``M_SUB`` / ``B_MUL``, this matrix alone does not
+    realise the op. Its role is to expose, at the weight level, that
+    the FF receives exactly the two scalars and nothing else.
+    """
+    W = torch.zeros(2, 2 * d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = 1.0                   # va
+    W[1, d_model + DIM_VALUE] = 1.0         # vb
+    return W
+
+
+def _M_REM_S_matrix(d_model: int = D_MODEL) -> torch.Tensor:
+    """Pair-selector for REM_S: identical shape/role to :func:`_M_DIV_S_matrix`.
+
+    The boundary nonlinearity is ``_trunc_rem(vb, va)``.
+    """
+    W = torch.zeros(2, 2 * d_model, dtype=DTYPE)
+    W[0, DIM_VALUE] = 1.0
+    W[1, d_model + DIM_VALUE] = 1.0
+    return W
+
+
 # Module-scope cached tensors — read-only; wrapped on access.
 M_ADD: torch.Tensor = _M_ADD_matrix()
 M_SUB: torch.Tensor = _M_SUB_matrix()
 B_MUL: torch.Tensor = _B_MUL_matrix()
+M_DIV_S: torch.Tensor = _M_DIV_S_matrix()
+M_REM_S: torch.Tensor = _M_REM_S_matrix()
 
 
 def n_parameters(d_model: int = D_MODEL) -> int:
-    """Parameter count contributed by ``M_ADD``, ``M_SUB``, ``B_MUL``.
+    """Parameter count contributed by the analytically-set FF weights.
 
-    Counts the actual non-zero entries (3) — the dense shapes hold only
-    these three symbolic "slots". The blog post's "964 compiled parameters"
-    figure should become ``964 + 3`` after this module lands; the stored
-    tensors are larger but the analytically-set content is three bits.
+    Counts non-zero entries: 2 (M_ADD) + 2 (M_SUB) + 1 (B_MUL) + 2 (M_DIV_S)
+    + 2 (M_REM_S) = 9. The stored tensors are larger but the analytically-set
+    content is nine bits. Pre-#75 the count was 3 (ADD/SUB/MUL only).
     """
-    return 3
+    return 9
 
 
 # ─── Numeric primitives (float tensors) ───────────────────────────
@@ -224,6 +278,42 @@ def forward_mul(ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def forward_div_s(ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
+    """Compute ``E(trunc_div(vb, va))`` from ``E(a), E(b)``.
+
+    Applies ``M_DIV_S`` as a pair-selector (``[va, vb] = M_DIV_S @ stacked``)
+    and then the truncating integer division ``_trunc_div(vb, va)`` — the
+    non-linear boundary step that polynomial algebra cannot express.
+    Matches the existing numeric path in ``executor.py:836``:
+    ``_trunc_div(vb, va)`` with ``va`` = top, ``vb`` = stack[SP-1].
+    """
+    stacked = torch.cat([ea, eb])                 # shape (2*d_model,)
+    pair = M_DIV_S @ stacked                      # shape (2,): [va, vb]
+    va = int(round(float(pair[0].item())))
+    vb = int(round(float(pair[1].item())))
+    q = _trunc_div(vb, va)                        # boundary nonlinearity
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(q)
+    return out
+
+
+def forward_rem_s(ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
+    """Compute ``E(trunc_rem(vb, va))`` from ``E(a), E(b)``.
+
+    Same pair-selector pattern as :func:`forward_div_s`; the boundary
+    nonlinearity is ``_trunc_rem(vb, va)`` (sign-of-dividend remainder,
+    matching WASM ``i32.rem_s``).
+    """
+    stacked = torch.cat([ea, eb])
+    pair = M_REM_S @ stacked
+    va = int(round(float(pair[0].item())))
+    vb = int(round(float(pair[1].item())))
+    r = _trunc_rem(vb, va)
+    out = torch.zeros(ea.shape[0], dtype=DTYPE)
+    out[DIM_VALUE] = float(r)
+    return out
+
+
 # ─── Symbolic primitives (Poly values) ────────────────────────────
 #
 # These ARE polynomial algebra — ``Poly`` overloads ``+ - *`` — but they
@@ -250,17 +340,37 @@ def symbolic_mul(pa: Poly, pb: Poly) -> Poly:
     return pa * pb
 
 
-# Triple of bilinear-FF primitives, packaged for
-# :func:`symbolic_executor.run_forking`'s ``arithmetic_ops`` hook
-# (issue #68 S3). ``symbolic_sub`` returns ``pb - pa`` to match the
-# FF dispatch order (``va`` is top, ``vb`` is stack[SP-1]); the
-# forking executor's internal order is ``a - b`` where ``a`` is
-# stack[SP-1] and ``b`` is top, so we bind ``sub=lambda a, b:
-# symbolic_sub(b, a)`` to keep the two orders aligned.
+def symbolic_div_s(pa: Poly, pb: Poly) -> RationalPoly:
+    """Rational form of DIV_S; corresponds to ``forward_div_s`` over :class:`Poly`.
+
+    Order matches ``forward_div_s`` (``pa`` is top, ``pb`` is stack[SP-1]):
+    returns ``RationalPoly(num=pb, denom=pa)``. Truncation to int happens
+    at :meth:`RationalPoly.eval_at` time (the boundary step).
+    """
+    return RationalPoly(num=pb, denom=pa)
+
+
+def symbolic_rem_s(pa: Poly, pb: Poly) -> SymbolicRemainder:
+    """Symbolic remainder; corresponds to ``forward_rem_s`` over :class:`Poly`.
+
+    Order matches ``forward_rem_s``. Truncation-style remainder is applied
+    at :meth:`SymbolicRemainder.eval_at` time.
+    """
+    return SymbolicRemainder(num=pb, denom=pa)
+
+
+# Arithmetic primitives packaged for :func:`symbolic_executor.run_forking`'s
+# ``arithmetic_ops`` hook (issue #68 S3; extended for DIV_S/REM_S in #75).
+# The wrappers flip arg order where needed: the forking executor's convention
+# is ``op(a, b)`` with ``a`` = stack[SP-1] and ``b`` = top. ``symbolic_sub`` /
+# ``symbolic_div_s`` / ``symbolic_rem_s`` are written in the FF ``(pa, pb)``
+# order where ``pa`` = top, ``pb`` = SP-1, so we call them with ``(b, a)``.
 FF_ARITHMETIC_OPS = ArithmeticOps(
     add=lambda a, b: symbolic_add(a, b),
     sub=lambda a, b: symbolic_sub(b, a),
     mul=lambda a, b: symbolic_mul(a, b),
+    div_s=lambda a, b: symbolic_div_s(b, a),
+    rem_s=lambda a, b: symbolic_rem_s(b, a),
 )
 
 
@@ -274,6 +384,7 @@ FF_ARITHMETIC_OPS = ArithmeticOps(
 _SCOPE_OPS = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT, isa.OP_NOP,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
+    isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT,
 }
 
@@ -282,14 +393,17 @@ _SCOPE_OPS = {
 class SymbolicForwardResult:
     """Outcome of :meth:`CompiledModel.forward_symbolic`.
 
-    ``top`` is the :class:`Poly` left on top of the symbolic stack at HALT.
-    ``stack`` is the full final stack (bottom at index 0). ``n_heads`` is
-    the number of non-NOP, non-HALT instructions executed — the "k heads"
-    matching :class:`symbolic_executor.SymbolicResult.n_heads`. ``bindings``
+    ``top`` is the value left on top of the symbolic stack at HALT — a
+    :class:`Poly` for the arithmetic fragment, a :class:`RationalPoly`
+    when the last op is DIV_S, or a :class:`SymbolicRemainder` when the
+    last op is REM_S (issue #75). ``stack`` is the full final stack
+    (bottom at index 0). ``n_heads`` is the number of non-NOP, non-HALT
+    instructions executed — the "k heads" matching
+    :class:`symbolic_executor.SymbolicResult.n_heads`. ``bindings``
     records which variable id corresponds to which PUSH constant.
     """
-    top: Poly
-    stack: List[Poly]
+    top: RationalStackValue
+    stack: List[RationalStackValue]
     n_heads: int
     bindings: Dict[int, int]
 
@@ -298,28 +412,37 @@ def evaluate_program(prog) -> SymbolicForwardResult:
     """Run ``prog`` through the bilinear FF interpreters over :class:`Poly`.
 
     Matches :func:`symbolic_executor.run_symbolic` semantically: branchless
-    straight-line programs only, one variable per PUSH, ADD/SUB/MUL delegated
-    to the symbolic primitives above. The point of duplicating the driver is
-    to make the bilinear dispatch story explicit — every arithmetic call
-    site here is the :class:`Poly` interpretation of one of the three
-    weight matrices.
+    straight-line programs only, one variable per PUSH, arithmetic delegated
+    to this module's symbolic primitives. The point of duplicating the
+    driver is to make the weight-level dispatch story explicit — every
+    arithmetic call site here is the :class:`Poly` interpretation of one
+    of the FF weight matrices (or, for DIV_S / REM_S, the rational-pair
+    form carried by :class:`RationalPoly` / :class:`SymbolicRemainder`).
     """
-    stack: List[Poly] = []
+    stack: List[RationalStackValue] = []
     bindings: Dict[int, int] = {}
     next_var = 0
     n_heads = 0
 
-    def _pop() -> Poly:
+    def _pop() -> RationalStackValue:
         if not stack:
             raise IndexError("symbolic stack underflow")
         return stack.pop()
+
+    def _require_poly(v: RationalStackValue, op_name: str) -> Poly:
+        if not isinstance(v, Poly):
+            raise BlockedOpcodeForSymbolic(
+                f"{op_name} on rational stack entries is out of scope "
+                f"(composition past one DIV_S/REM_S is a follow-up)"
+            )
+        return v
 
     for instr in prog:
         op = instr.op
         if op not in _SCOPE_OPS:
             raise BlockedOpcodeForSymbolic(
                 f"op {isa.OP_NAMES.get(op, f'?{op}')!r} is out of scope for the "
-                f"bilinear FF dispatch (ADD/SUB/MUL + stack manip only)"
+                f"bilinear FF dispatch (ADD/SUB/MUL/DIV_S/REM_S + stack manip only)"
             )
         if op == isa.OP_HALT:
             break
@@ -338,14 +461,22 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                 raise IndexError("dup on empty stack")
             stack.append(stack[-1])
         elif op == isa.OP_ADD:
-            b = _pop(); a = _pop()
+            b = _require_poly(_pop(), "ADD"); a = _require_poly(_pop(), "ADD")
             stack.append(symbolic_add(a, b))
         elif op == isa.OP_SUB:
-            b = _pop(); a = _pop()
+            b = _require_poly(_pop(), "SUB"); a = _require_poly(_pop(), "SUB")
             stack.append(symbolic_sub(a, b))
         elif op == isa.OP_MUL:
-            b = _pop(); a = _pop()
+            b = _require_poly(_pop(), "MUL"); a = _require_poly(_pop(), "MUL")
             stack.append(symbolic_mul(a, b))
+        elif op == isa.OP_DIV_S:
+            b = _require_poly(_pop(), "DIV_S"); a = _require_poly(_pop(), "DIV_S")
+            # forking executor convention: a = SP-1, b = top; result = a / b.
+            # symbolic_div_s uses (pa=top, pb=SP-1) ordering.
+            stack.append(symbolic_div_s(b, a))
+        elif op == isa.OP_REM_S:
+            b = _require_poly(_pop(), "REM_S"); a = _require_poly(_pop(), "REM_S")
+            stack.append(symbolic_rem_s(b, a))
         elif op == isa.OP_SWAP:
             if len(stack) < 2:
                 raise IndexError("swap needs 2 entries")
@@ -362,7 +493,7 @@ def evaluate_program(prog) -> SymbolicForwardResult:
         else:  # pragma: no cover — guarded by _SCOPE_OPS above
             raise BlockedOpcodeForSymbolic(f"unreachable: op {op}")
 
-    top = stack[-1] if stack else Poly.constant(0)
+    top: RationalStackValue = stack[-1] if stack else Poly.constant(0)
     return SymbolicForwardResult(top=top, stack=list(stack),
                                  n_heads=n_heads, bindings=bindings)
 
@@ -396,10 +527,12 @@ __all__ = [
     "RangeCheckFailure",
     "I32_MIN", "I32_MAX",
     "E", "E_inv",
-    "M_ADD", "M_SUB", "B_MUL",
+    "M_ADD", "M_SUB", "B_MUL", "M_DIV_S", "M_REM_S",
     "n_parameters",
     "forward_add", "forward_sub", "forward_mul",
+    "forward_div_s", "forward_rem_s",
     "symbolic_add", "symbolic_sub", "symbolic_mul",
+    "symbolic_div_s", "symbolic_rem_s",
     "FF_ARITHMETIC_OPS",
     "SymbolicForwardResult",
     "evaluate_program",
