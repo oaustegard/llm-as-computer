@@ -37,6 +37,7 @@ import isa
 from executor import CompiledModel, NumPyExecutor
 from isa import DIM_VALUE, program
 from symbolic_executor import (
+    BitVec,
     GuardedPoly,
     IndicatorPoly,
     Poly,
@@ -795,6 +796,227 @@ def test_native_max_three_way_numeric():
         )
 
 
+# ─── Bit-vector primitives (issue #77) ────────────────────────────
+
+def test_primitives_forward_bit_binary():
+    """forward_bit_binary(ea, eb, op) returns E(bit_binary(vb, va)).
+
+    Convention: ``ea`` is va (top of stack), ``eb`` is vb (SP-1). WASM
+    ``SHL(value, count) = value << count`` with value=SP-1, count=top, so
+    ``forward_bit_binary(E(count), E(value), SHL)`` matches
+    ``_apply_bitop("SHL", [value, count])``.
+    """
+    cases = [
+        # (op, va=top, vb=SP-1, expected)
+        (isa.OP_AND,   10, 12, 12 & 10),
+        (isa.OP_OR,    10, 12, 12 | 10),
+        (isa.OP_XOR,   10, 12, 12 ^ 10),
+        (isa.OP_SHL,   2,  3,  (3 << 2) & 0xFFFFFFFF),
+        (isa.OP_SHR_U, 1,  0xFFFFFFFF, 0x7FFFFFFF),
+        (isa.OP_SHR_S, 1,  -4 & 0xFFFFFFFF, (-2) & 0xFFFFFFFF),
+    ]
+    for op, va, vb, expected in cases:
+        ea, eb = ff.E(va), ff.E(vb)
+        got = ff.E_inv(ff.forward_bit_binary(ea, eb, op))
+        _check(
+            f"forward_bit_binary[{isa.OP_NAMES[op]}](va={va},vb={vb})",
+            got == expected,
+            f"got {got}, expect {expected}",
+        )
+
+
+def test_primitives_forward_bit_unary():
+    """forward_bit_unary(ea, op) returns E(bit_unary(va)) for CLZ/CTZ/POPCNT."""
+    cases = [
+        (isa.OP_CLZ,    16, 27),   # 0x00000010
+        (isa.OP_CLZ,    0,  32),
+        (isa.OP_CLZ,    -1, 0),    # 0xFFFFFFFF
+        (isa.OP_CTZ,    8,  3),    # 0b1000
+        (isa.OP_CTZ,    0,  32),
+        (isa.OP_POPCNT, 13, 3),    # 0b1101
+        (isa.OP_POPCNT, 0,  0),
+        (isa.OP_POPCNT, -1, 32),
+    ]
+    for op, n, expected in cases:
+        got = ff.E_inv(ff.forward_bit_unary(ff.E(n), op))
+        _check(
+            f"forward_bit_unary[{isa.OP_NAMES[op]}]({n})",
+            got == expected,
+            f"got {got}, expect {expected}",
+        )
+
+
+def test_primitives_bitvec_matrix_shapes():
+    """``M_BITBIN`` is a (2, 2*d) pair-selector; ``M_BITUN`` is a
+    (1, d) single-value extractor. Both are pure weight tensors — the
+    non-polynomial bit op lives at the boundary (in ``_apply_bitop``),
+    not inside these matrices."""
+    d = ff.D_MODEL
+    _check("M_BITBIN shape", ff.M_BITBIN.shape == (2, 2 * d))
+    _check("M_BITUN shape",  ff.M_BITUN.shape == (1, d))
+
+    # M_BITBIN: row 0 picks va (top) from ea @ DIM_VALUE; row 1 picks vb
+    # (SP-1) from eb @ d + DIM_VALUE. Exactly 2 nonzeros total.
+    _check("M_BITBIN[0, DIM_VALUE] == 1",
+           float(ff.M_BITBIN[0, DIM_VALUE].item()) == 1.0)
+    _check("M_BITBIN[1, d+DIM_VALUE] == 1",
+           float(ff.M_BITBIN[1, d + DIM_VALUE].item()) == 1.0)
+    nonzero_bin = (ff.M_BITBIN != 0).sum().item()
+    _check("M_BITBIN has exactly 2 nonzeros", nonzero_bin == 2)
+
+    # M_BITUN: single +1 at DIM_VALUE.
+    _check("M_BITUN[0, DIM_VALUE] == 1",
+           float(ff.M_BITUN[0, DIM_VALUE].item()) == 1.0)
+    nonzero_un = (ff.M_BITUN != 0).sum().item()
+    _check("M_BITUN has exactly 1 nonzero", nonzero_un == 1)
+
+
+def test_symbolic_bitvec_primitives():
+    """symbolic_bit_binary / symbolic_bit_unary return BitVec nodes with
+    the right op name and operands in natural left-right reading order
+    (left=SP-1, right=top)."""
+    x0, x1 = Poly.variable(0), Poly.variable(1)
+
+    for op, name in [
+        (isa.OP_AND, "AND"), (isa.OP_OR, "OR"), (isa.OP_XOR, "XOR"),
+        (isa.OP_SHL, "SHL"), (isa.OP_SHR_S, "SHR_S"), (isa.OP_SHR_U, "SHR_U"),
+    ]:
+        # pa=top=x0, pb=SP-1=x1 → operands (pb, pa) = (x1, x0).
+        bv = ff.symbolic_bit_binary(x0, x1, op)
+        _check(f"symbolic_bit_binary[{name}] type", isinstance(bv, BitVec))
+        _check(f"symbolic_bit_binary[{name}] op", bv.op == name)
+        _check(f"symbolic_bit_binary[{name}] operands[0]==x1 (SP-1)",
+               bv.operands[0] == x1)
+        _check(f"symbolic_bit_binary[{name}] operands[1]==x0 (top)",
+               bv.operands[1] == x0)
+
+    for op, name in [
+        (isa.OP_CLZ, "CLZ"), (isa.OP_CTZ, "CTZ"), (isa.OP_POPCNT, "POPCNT"),
+    ]:
+        bv = ff.symbolic_bit_unary(x0, op)
+        _check(f"symbolic_bit_unary[{name}] type", isinstance(bv, BitVec))
+        _check(f"symbolic_bit_unary[{name}] op", bv.op == name)
+        _check(f"symbolic_bit_unary[{name}] operands==(x0,)",
+               bv.operands == (x0,))
+
+
+def test_equivalence_bitvec_structural():
+    """forward_symbolic on each bit-vector program produces the same
+    BitVec AST the symbolic executor emits. Structural equality on
+    op name + operand tuples (value-based)."""
+    model = CompiledModel()
+    progs = [
+        ("AND",     program(("PUSH", 12), ("PUSH", 10), ("AND",),    ("HALT",))),
+        ("OR",      program(("PUSH", 12), ("PUSH", 10), ("OR",),     ("HALT",))),
+        ("XOR",     program(("PUSH", 12), ("PUSH", 10), ("XOR",),    ("HALT",))),
+        ("SHL",     program(("PUSH", 3),  ("PUSH", 2),  ("SHL",),    ("HALT",))),
+        ("SHR_S",   program(("PUSH", -4), ("PUSH", 1),  ("SHR_S",),  ("HALT",))),
+        ("SHR_U",   program(("PUSH", -1), ("PUSH", 4),  ("SHR_U",),  ("HALT",))),
+        ("CLZ",     program(("PUSH", 16), ("CLZ",),     ("HALT",))),
+        ("CTZ",     program(("PUSH", 8),  ("CTZ",),     ("HALT",))),
+        ("POPCNT",  program(("PUSH", 13), ("POPCNT",),  ("HALT",))),
+    ]
+    for name, prog in progs:
+        sym = run_symbolic(prog)
+        fs = model.forward_symbolic(prog)
+        _check(
+            f"bitvec.struct.type[{name}]",
+            isinstance(sym.top, BitVec) and isinstance(fs.top, BitVec),
+            f"sym={type(sym.top).__name__}, ff={type(fs.top).__name__}",
+        )
+        _check(
+            f"bitvec.struct.eq[{name}]",
+            sym.top == fs.top,
+            f"sym={sym.top!r}  ff={fs.top!r}",
+        )
+
+
+def test_equivalence_bitvec_nested_structural():
+    """Nested bit programs (bit_extract = ``AND(1, SHR_U(n, k))``) and
+    hybrid arithmetic (log2_floor = ``SUB(31, CLZ(n))``) must produce
+    identical BitVec ASTs from both executors."""
+    import programs as P
+    model = CompiledModel()
+
+    for name, (prog, _expected) in [
+        ("bit_extract(5,0)", P.make_bit_extract(5, 0)),
+        ("log2_floor(8)",    P.make_log2_floor(8)),
+    ]:
+        sym = run_symbolic(prog)
+        fs = model.forward_symbolic(prog)
+        _check(f"bitvec.nested.type[{name}]",
+               isinstance(sym.top, BitVec) and isinstance(fs.top, BitVec))
+        _check(f"bitvec.nested.eq[{name}]", sym.top == fs.top,
+               f"sym={sym.top!r}  ff={fs.top!r}")
+
+
+def test_equivalence_is_power_of_2_structural():
+    """is_power_of_2's IndicatorPoly wraps a BitVec("SUB", ...) diff on
+    both paths — sym and FF must produce the same indicator (widened
+    IndicatorPoly.poly accepts BitVec per issue #77)."""
+    import programs as P
+    model = CompiledModel()
+    prog, _expected = P.make_is_power_of_2(8)
+    sym = run_symbolic(prog)
+    fs = model.forward_symbolic(prog)
+    _check("is_power_of_2.struct.type",
+           isinstance(sym.top, IndicatorPoly) and isinstance(fs.top, IndicatorPoly))
+    _check("is_power_of_2.struct.poly", sym.top.poly == fs.top.poly,
+           f"sym={sym.top.poly!r}  ff={fs.top.poly!r}")
+    _check("is_power_of_2.struct.rel", sym.top.relation == fs.top.relation)
+
+
+def test_equivalence_bitvec_numeric():
+    """Three-way check: ``sym.top.eval_at == NumPy top == TorchExecutor top``
+    for every bit-vector row. Ensures M_BITBIN / M_BITUN realise the same
+    ops the symbolic AST does."""
+    from executor import TorchExecutor
+    import programs as P
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+    torch_exec = TorchExecutor(model)
+
+    cases = [
+        ("bitwise_and(12,10)",  P.make_bitwise_binary(isa.OP_AND, 12, 10)),
+        ("bitwise_or(12,10)",   P.make_bitwise_binary(isa.OP_OR, 12, 10)),
+        ("bitwise_xor(12,10)",  P.make_bitwise_binary(isa.OP_XOR, 12, 10)),
+        ("bitwise_shl(3,2)",    P.make_bitwise_binary(isa.OP_SHL, 3, 2)),
+        ("bitwise_shr_u(-1,4)", P.make_bitwise_binary(isa.OP_SHR_U, -1, 4)),
+        ("native_clz(16)",      P.make_native_clz(16)),
+        ("native_ctz(8)",       P.make_native_ctz(8)),
+        ("native_popcnt(13)",   P.make_native_popcnt(13)),
+        ("bit_extract(5,0)",    P.make_bit_extract(5, 0)),
+        ("log2_floor(8)",       P.make_log2_floor(8)),
+        ("is_power_of_2(8)",    P.make_is_power_of_2(8)),
+    ]
+    for name, (prog, expected) in cases:
+        sym = run_symbolic(prog)
+        try:
+            sym_val = sym.top.eval_at(sym.bindings)
+        except Exception as e:
+            _fail(f"bitvec.numeric[{name}]",
+                  f"sym eval raised: {type(e).__name__}: {e}")
+            continue
+        np_top = np_exec.execute(prog).steps[-1].top
+        t_top = torch_exec.execute(prog).steps[-1].top
+        _check(
+            f"bitvec.numeric[{name}]",
+            sym_val == np_top == t_top == expected,
+            f"sym={sym_val} np={np_top} torch={t_top} expected={expected}",
+        )
+
+
+def test_bitvec_parameter_count():
+    """Issue #77 adds 3 non-zero weights to the FF layer:
+    M_BITBIN's 2-entry pair selector + M_BITUN's 1-entry extractor.
+    ``ff.n_parameters()`` must reflect this so the budget tracking
+    stays honest."""
+    n = ff.n_parameters()
+    # M_ADD (2) + M_SUB (2) + B_MUL (1) + M_DIV_S (2) + M_REM_S (2)
+    # + M_CMP (2) + M_EQZ (1) + M_BITBIN (2) + M_BITUN (1) = 15
+    _check("n_parameters == 15", n == 15, f"got {n}")
+
+
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
 def test_blocked_opcodes():
@@ -829,13 +1051,14 @@ def test_blocked_opcodes():
     except ff.BlockedOpcodeForSymbolic:
         _pass("blocked[JZ]")
 
-    # AND: bitwise.
-    prog = program(("PUSH", 12), ("PUSH", 10), ("AND",), ("HALT",))
+    # ABS: unary non-polynomial op outside the bitwise fragment (issue #77
+    # brought AND/OR/XOR/SHL/SHR_S/SHR_U/CLZ/CTZ/POPCNT into scope).
+    prog = program(("PUSH", -3), ("ABS",), ("HALT",))
     try:
         model.forward_symbolic(prog)
-        _fail("blocked[AND]", "expected BlockedOpcodeForSymbolic")
+        _fail("blocked[ABS]", "expected BlockedOpcodeForSymbolic")
     except ff.BlockedOpcodeForSymbolic:
-        _pass("blocked[AND]")
+        _pass("blocked[ABS]")
 
 
 # ─── Runner ───────────────────────────────────────────────────────
@@ -867,6 +1090,15 @@ def main():
         test_equivalence_eqz_structural,
         test_equivalence_comparison_numeric,
         test_native_max_three_way_numeric,
+        test_primitives_forward_bit_binary,
+        test_primitives_forward_bit_unary,
+        test_primitives_bitvec_matrix_shapes,
+        test_symbolic_bitvec_primitives,
+        test_equivalence_bitvec_structural,
+        test_equivalence_bitvec_nested_structural,
+        test_equivalence_is_power_of_2_structural,
+        test_equivalence_bitvec_numeric,
+        test_bitvec_parameter_count,
         test_blocked_opcodes,
     ]
     print("=" * 60)

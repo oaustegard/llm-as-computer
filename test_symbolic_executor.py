@@ -22,6 +22,7 @@ import isa
 from executor import NumPyExecutor
 from isa import program
 from symbolic_executor import (
+    BitVec,
     Guard,
     GuardedPoly,
     IndicatorPoly,
@@ -333,6 +334,201 @@ def test_composition_past_indicator_blocked():
         raise AssertionError(
             "expected SymbolicOpNotSupported for ADD on IndicatorPoly"
         )
+
+
+
+# ─── Bit-vector AST (issue #77) ──────────────────────────────────
+
+def test_bitvec_binary_op_wraps_operands_in_natural_order():
+    """AND/OR/XOR/SHL/SHR_S/SHR_U wrap ``(SP-1, top)`` verbatim — the
+    natural left-right reading order. The executor doesn't simplify
+    ``AND(x, x) → x``; the AST is intentionally literal."""
+    for op_code, name in [
+        (isa.OP_AND, "AND"), (isa.OP_OR, "OR"), (isa.OP_XOR, "XOR"),
+        (isa.OP_SHL, "SHL"), (isa.OP_SHR_S, "SHR_S"), (isa.OP_SHR_U, "SHR_U"),
+    ]:
+        prog = [
+            isa.Instruction(isa.OP_PUSH, 12),
+            isa.Instruction(isa.OP_PUSH, 10),
+            isa.Instruction(op_code),
+            isa.Instruction(isa.OP_HALT),
+        ]
+        r = run_symbolic(prog)
+        assert isinstance(r.top, BitVec), f"{name}: got {type(r.top).__name__}"
+        assert r.top.op == name
+        assert len(r.top.operands) == 2
+        # SP-1 was variable-from-PUSH-12, top was variable-from-PUSH-10.
+        a, b = r.top.operands
+        assert r.bindings[a.variables()[0]] == 12  # SP-1
+        assert r.bindings[b.variables()[0]] == 10  # top
+
+
+def test_bitvec_unary_op_single_operand():
+    """CLZ/CTZ/POPCNT wrap a single operand."""
+    for op_code, name in [
+        (isa.OP_CLZ, "CLZ"), (isa.OP_CTZ, "CTZ"), (isa.OP_POPCNT, "POPCNT"),
+    ]:
+        prog = [
+            isa.Instruction(isa.OP_PUSH, 13),
+            isa.Instruction(op_code),
+            isa.Instruction(isa.OP_HALT),
+        ]
+        r = run_symbolic(prog)
+        assert isinstance(r.top, BitVec)
+        assert r.top.op == name
+        assert len(r.top.operands) == 1
+
+
+def test_bitvec_eval_at_matches_numpy_binary():
+    """Every binary bit-op's ``BitVec.eval_at`` matches NumPyExecutor's
+    numeric result across a spread of i32 inputs."""
+    np_exec = NumPyExecutor()
+    pairs = [(12, 10), (0, 5), (5, 0), (-1, 3), (0xFF, 0xF0),
+             (0x80000000, 1), (7, 2)]
+    failures = []
+    for op_code in [isa.OP_AND, isa.OP_OR, isa.OP_XOR,
+                    isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U]:
+        for a, b in pairs:
+            prog = [
+                isa.Instruction(isa.OP_PUSH, a),
+                isa.Instruction(isa.OP_PUSH, b),
+                isa.Instruction(op_code),
+                isa.Instruction(isa.OP_HALT),
+            ]
+            numeric = np_exec.execute(prog).steps[-1].top
+            r = run_symbolic(prog)
+            symbolic = r.top.eval_at(r.bindings)
+            if numeric != symbolic:
+                failures.append(
+                    f"op={isa.OP_NAMES[op_code]} a={a} b={b} "
+                    f"numeric={numeric} symbolic={symbolic}"
+                )
+    assert not failures, "\n  ".join(["mismatches:"] + failures)
+
+
+def test_bitvec_eval_at_matches_numpy_unary():
+    """CLZ/CTZ/POPCNT's ``BitVec.eval_at`` matches NumPyExecutor across
+    inputs spanning the zero / low-bit / high-bit regions."""
+    np_exec = NumPyExecutor()
+    values = [0, 1, 2, 7, 8, 16, 0xFF, 0x80000000, -1, 13]
+    failures = []
+    for op_code in [isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT]:
+        for n in values:
+            prog = [
+                isa.Instruction(isa.OP_PUSH, n),
+                isa.Instruction(op_code),
+                isa.Instruction(isa.OP_HALT),
+            ]
+            numeric = np_exec.execute(prog).steps[-1].top
+            r = run_symbolic(prog)
+            symbolic = r.top.eval_at(r.bindings)
+            if numeric != symbolic:
+                failures.append(
+                    f"op={isa.OP_NAMES[op_code]} n={n} "
+                    f"numeric={numeric} symbolic={symbolic}"
+                )
+    assert not failures, "\n  ".join(["mismatches:"] + failures)
+
+
+def test_bitvec_hybrid_arithmetic_lifts_into_ast():
+    """``log2_floor(n) = 31 - CLZ(n)`` — SUB with a BitVec operand must
+    lift into the BitVec AST rather than widening Poly. The top is
+    a BitVec("SUB", (Poly(31), BitVec("CLZ", (n,)))) tree."""
+    import programs as P
+    prog, expected = P.make_log2_floor(8)
+    r = run_symbolic(prog)
+    assert isinstance(r.top, BitVec)
+    assert r.top.op == "SUB"
+    assert r.top.eval_at(r.bindings) == expected
+
+
+def test_bitvec_nested_ast_bit_extract():
+    """``bit_extract(n, k) = (n >>u k) & 1`` — AND wraps an inner
+    SHR_U BitVec, exercising nested AST composition."""
+    import programs as P
+    prog, expected = P.make_bit_extract(5, 0)
+    r = run_symbolic(prog)
+    assert isinstance(r.top, BitVec)
+    assert r.top.op == "AND"
+    # Outer op is AND; left operand is a BitVec (inner SHR_U).
+    assert isinstance(r.top.operands[0], BitVec)
+    assert r.top.operands[0].op == "SHR_U"
+    assert r.top.eval_at(r.bindings) == expected
+
+
+def test_bitvec_wrapped_in_indicator_is_power_of_2():
+    """``is_power_of_2(n) = (POPCNT(n) == 1)`` — EQ wraps its BitVec
+    diff in an IndicatorPoly. Issue #77 widened IndicatorPoly.poly to
+    accept BitVec."""
+    import programs as P
+    prog, expected = P.make_is_power_of_2(8)
+    r = run_symbolic(prog)
+    assert isinstance(r.top, IndicatorPoly)
+    assert isinstance(r.top.poly, BitVec)
+    assert r.top.eval_at(r.bindings) == expected
+
+
+def test_bitvec_equivalence_across_catalog_rows():
+    """Every bit-vector catalog program: ``run_symbolic(...).top.eval_at``
+    matches NumPyExecutor's top. Covers AND/OR/XOR/CLZ/CTZ/POPCNT +
+    bit_extract + log2_floor. (``is_power_of_2`` covered by
+    ``test_bitvec_wrapped_in_indicator_is_power_of_2``; ``popcount_loop``
+    needs the forking executor's concrete-mode unroll.)"""
+    import programs as P
+    np_exec = NumPyExecutor()
+    cases = [
+        ("bitwise_and(12,10)",    P.make_bitwise_binary(isa.OP_AND, 12, 10)),
+        ("bitwise_or(12,10)",     P.make_bitwise_binary(isa.OP_OR, 12, 10)),
+        ("bitwise_xor(12,10)",    P.make_bitwise_binary(isa.OP_XOR, 12, 10)),
+        ("bitwise_shl(3,2)",      P.make_bitwise_binary(isa.OP_SHL, 3, 2)),
+        ("bitwise_shr_u(-1,4)",   P.make_bitwise_binary(isa.OP_SHR_U, -1, 4)),
+        ("bitwise_shr_s(-1,4)",   P.make_bitwise_binary(isa.OP_SHR_S, -1, 4)),
+        ("native_clz(16)",        P.make_native_clz(16)),
+        ("native_ctz(8)",         P.make_native_ctz(8)),
+        ("native_popcnt(13)",     P.make_native_popcnt(13)),
+        ("bit_extract(5,0)",      P.make_bit_extract(5, 0)),
+        ("log2_floor(8)",         P.make_log2_floor(8)),
+    ]
+    failures = []
+    for name, (prog, expected) in cases:
+        numeric = np_exec.execute(prog).steps[-1].top
+        r = run_symbolic(prog)
+        try:
+            symbolic = r.top.eval_at(r.bindings)
+        except Exception as e:
+            failures.append(f"{name}: eval_at raised {type(e).__name__}: {e}")
+            continue
+        if numeric != symbolic or numeric != expected:
+            failures.append(
+                f"{name}: numeric={numeric} symbolic={symbolic} "
+                f"expected={expected}"
+            )
+    assert not failures, "\n  ".join(["mismatches:"] + failures)
+
+
+def test_bitvec_popcount_loop_unrolls_in_concrete_mode():
+    """popcount_loop's JZ on a BitVec cond is out-of-scope in symbolic
+    mode, but concrete mode reduces the BitVec to a literal at each
+    step so the loop unrolls deterministically (issue #77)."""
+    import programs as P
+    prog, expected = P.make_popcount_loop(5)
+    r = run_forking(prog, input_mode="concrete")
+    assert r.status == "unrolled"
+    # Top may be a BitVec (residual AST with only literals inside).
+    if isinstance(r.top, BitVec):
+        assert r.top.eval_at({}) == expected
+    else:
+        assert r.top.eval_at({}) == expected
+
+
+def test_bitvec_structural_equality():
+    """Two BitVec nodes with the same op + operands compare equal —
+    the equivalence test for the FF bit-op primitives."""
+    a = Poly.variable(0)
+    b = Poly.variable(1)
+    assert BitVec("AND", (a, b)) == BitVec("AND", (a, b))
+    assert BitVec("AND", (a, b)) != BitVec("OR", (a, b))
+    assert BitVec("AND", (a, b)) != BitVec("AND", (b, a))  # order matters
 
 
 # ─── Cross-check against NumPyExecutor ────────────────────────────
