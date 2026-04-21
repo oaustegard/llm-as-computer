@@ -36,6 +36,7 @@ import isa
 from executor import NumPyExecutor
 from isa import program
 from symbolic_executor import (
+    BitVec,
     ForkingResult,
     Guard,
     GuardedPoly,
@@ -111,6 +112,10 @@ _POLY_OPS = {
     # hoist relations into Guards when consumed by JZ/JNZ.
     isa.OP_EQZ, isa.OP_EQ, isa.OP_NE,
     isa.OP_LT_S, isa.OP_GT_S, isa.OP_LE_S, isa.OP_GE_S,
+    # Bit-vector fragment (issue #77) — collapse to BitVec AST tops.
+    isa.OP_AND, isa.OP_OR, isa.OP_XOR,
+    isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U,
+    isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT,
 }
 # Control flow — handled by the forking executor (issue #70).
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
@@ -141,6 +146,10 @@ class ClassificationResult:
     # comparison (EQZ/EQ/NE/LT_S/LE_S/GT_S/GE_S) with an unconsumed
     # IndicatorPoly on top of the stack.
     indicator: Optional[IndicatorPoly] = None
+    # BitVec tops (issue #77) — present when the program ends on any
+    # bit-vector op (AND/OR/XOR/SHL/SHR_S/SHR_U/CLZ/CTZ/POPCNT) or a
+    # hybrid arithmetic op lifted into the BitVec AST.
+    bitvec: Optional[BitVec] = None
     n_heads: int = 0
     bindings: Dict[int, int] = field(default_factory=dict)
     n_cases: int = 0                       # number of cases in guarded output
@@ -176,8 +185,36 @@ def classify_program(prog) -> ClassificationResult:
 
     try:
         r_sym = run_forking(prog, input_mode="symbolic")
-    except SymbolicOpNotSupported as e:
-        return ClassificationResult(status=STATUS_BLOCKED_OPCODE, blocker=str(e))
+    except SymbolicOpNotSupported as sym_err:
+        # Symbolic mode might fail on paths that concrete mode handles
+        # (e.g. a bit-op loop where JZ on a BitVec cond is symbolic-only
+        # out of scope, but concrete PUSHs reduce the BitVec to a
+        # literal — issue #77). Retry in concrete mode before blocking.
+        try:
+            r_conc = run_forking(prog, input_mode="concrete")
+        except (SymbolicOpNotSupported, SymbolicStackUnderflow):
+            return ClassificationResult(
+                status=STATUS_BLOCKED_OPCODE, blocker=str(sym_err)
+            )
+        if r_conc.status in ("straight", "unrolled") and isinstance(r_conc.top, Poly):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_UNROLLED, poly=r_conc.top,
+                n_heads=r_conc.n_heads, bindings={},
+            )
+        if r_conc.status in ("straight", "unrolled") and isinstance(r_conc.top, BitVec):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_UNROLLED, bitvec=r_conc.top,
+                n_heads=r_conc.n_heads, bindings={},
+            )
+        if r_conc.status == "guarded" and isinstance(r_conc.top, GuardedPoly):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_UNROLLED, guarded=r_conc.top,
+                n_heads=r_conc.n_heads, bindings={},
+                n_cases=r_conc.top.n_cases(),
+            )
+        return ClassificationResult(
+            status=STATUS_BLOCKED_OPCODE, blocker=str(sym_err)
+        )
     except SymbolicStackUnderflow as e:
         return ClassificationResult(status=STATUS_BLOCKED_UNDERFLOW, blocker=str(e))
 
@@ -190,6 +227,11 @@ def classify_program(prog) -> ClassificationResult:
         if isinstance(r_sym.top, IndicatorPoly):
             return ClassificationResult(
                 status=STATUS_COLLAPSED, indicator=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
+        if isinstance(r_sym.top, BitVec):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED, bitvec=r_sym.top,
                 n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
             )
         if isinstance(r_sym.top, (RationalPoly, SymbolicRemainder)):
@@ -314,7 +356,6 @@ def _default_catalog() -> List[CatalogEntry]:
     entries.append(CatalogEntry("native_remainder(2,7)", *P.make_native_remainder(2, 7)))
 
     # Blocked — non-polynomial opcodes
-    entries.append(CatalogEntry("native_clz(16)",       *P.make_native_clz(16)))
     entries.append(CatalogEntry("native_abs_unary(-3)", *P.make_native_abs_unary(-3)))
     entries.append(CatalogEntry("native_neg(5)",        *P.make_native_neg(5)))
     # Comparisons (issue #76) — collapse to IndicatorPoly tops under
@@ -328,16 +369,38 @@ def _default_catalog() -> List[CatalogEntry]:
         "compare_eqz(0)",
         *P.make_compare_eqz(0),
     ))
+    # Bit-vector fragment (issue #77) — collapse to BitVec AST tops
+    # under the bilinear-form treatment. These rows used to land in
+    # ``blocked_opcode``; after M3 they classify as ``collapsed``
+    # (hybrid arithmetic like ``log2_floor`` lifts into the AST, and
+    # the ``is_power_of_2`` comparison wraps its BitVec in an
+    # IndicatorPoly).
     entries.append(CatalogEntry(
         "bitwise_and(12,10)",
         *P.make_bitwise_binary(isa.OP_AND, 12, 10),
     ))
+    entries.append(CatalogEntry(
+        "bitwise_or(12,10)",
+        *P.make_bitwise_binary(isa.OP_OR, 12, 10),
+    ))
+    entries.append(CatalogEntry(
+        "bitwise_xor(12,10)",
+        *P.make_bitwise_binary(isa.OP_XOR, 12, 10),
+    ))
+    entries.append(CatalogEntry("native_clz(16)",    *P.make_native_clz(16)))
+    entries.append(CatalogEntry("native_ctz(8)",     *P.make_native_ctz(8)))
+    entries.append(CatalogEntry("native_popcnt(13)", *P.make_native_popcnt(13)))
+    entries.append(CatalogEntry("bit_extract(5,0)",  *P.make_bit_extract(5, 0)))
+    entries.append(CatalogEntry("log2_floor(8)",     *P.make_log2_floor(8)))
+    entries.append(CatalogEntry("is_power_of_2(8)",  *P.make_is_power_of_2(8)))
 
     # Bounded loops — unroll cleanly at concrete inputs (issue #70).
-    entries.append(CatalogEntry("fibonacci(5)",  *P.make_fibonacci(5)))
-    entries.append(CatalogEntry("factorial(4)",  *P.make_factorial(4)))
-    entries.append(CatalogEntry("is_even(6)",    *P.make_is_even(6)))
-    entries.append(CatalogEntry("power_of_2(4)", *P.make_power_of_2(4)))
+    entries.append(CatalogEntry("fibonacci(5)",    *P.make_fibonacci(5)))
+    entries.append(CatalogEntry("factorial(4)",    *P.make_factorial(4)))
+    entries.append(CatalogEntry("is_even(6)",      *P.make_is_even(6)))
+    entries.append(CatalogEntry("power_of_2(4)",   *P.make_power_of_2(4)))
+    # Bit-vector loop (issue #77) — concrete-mode unroll with bit ops.
+    entries.append(CatalogEntry("popcount_loop(5)", *P.make_popcount_loop(5)))
 
     # Pure finite conditionals — collapse to guarded polys (issue #70).
     entries.append(CatalogEntry("select_by_sign(7)", *P.make_select_by_sign(7)))
@@ -400,6 +463,13 @@ class CatalogRow:
     # family has no sign primitive; the gate lives at the FF-dispatch
     # boundary rather than inside the polynomial.
     is_indicator: bool = False
+    # BitVec top flag (issue #77) — True for programs that collapse to a
+    # :class:`BitVec` AST (bit-vector fragment). eml_* columns stay
+    # ``None`` since the single-operator EML family has no bitwise
+    # primitive; the bit ops fire at the FF-dispatch boundary via
+    # ``M_BITBIN`` / ``M_BITUN``. ``n_monomials`` reports the AST's
+    # node count as a complexity proxy.
+    is_bitvec: bool = False
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -472,6 +542,8 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         if cr.status == STATUS_COLLAPSED or cr.status == STATUS_COLLAPSED_UNROLLED:
             if cr.indicator is not None:
                 _fill_indicator_row(row, cr.indicator, cr.bindings, row.numpy_top)
+            elif cr.bitvec is not None:
+                _fill_bitvec_row(row, cr.bitvec, cr.bindings, row.numpy_top)
             elif cr.rational is not None:
                 _fill_rational_row(row, cr.rational, cr.bindings, row.numpy_top)
             elif cr.poly is not None:
@@ -557,11 +629,59 @@ def _fill_indicator_row(row: CatalogRow, indicator: IndicatorPoly,
     """
     row.is_indicator = True
     row.poly_expr = repr(indicator)
-    row.n_monomials = indicator.poly.n_monomials()
+    # indicator.poly may be a Poly or (issue #77) a BitVec — count
+    # monomials for the former, AST nodes for the latter.
+    if isinstance(indicator.poly, BitVec):
+        row.n_monomials = _bitvec_node_count(indicator.poly)
+    else:
+        row.n_monomials = indicator.poly.n_monomials()
 
     try:
         sym_val = indicator.eval_at(bindings) if bindings else indicator.eval_at({})
     except KeyError:
+        sym_val = None
+
+    if sym_val is None or numpy_top is None:
+        row.numeric_match = None
+    else:
+        row.numeric_match = (sym_val == numpy_top)
+
+
+def _bitvec_node_count(node) -> int:
+    """Recursively count nodes in a BitVec / Poly AST."""
+    if isinstance(node, BitVec):
+        return 1 + sum(_bitvec_node_count(o) for o in node.operands)
+    if isinstance(node, Poly):
+        return node.n_monomials()
+    return 1
+
+
+def _fill_bitvec_row(row: CatalogRow, bitvec: BitVec,
+                     bindings: Dict[int, int],
+                     numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from a BitVec top (issue #77).
+
+    ``bitvec`` is a recursive AST over the bit-vector fragment
+    (``AND / OR / XOR / SHL / SHR_S / SHR_U / CLZ / CTZ / POPCNT``) plus
+    lifted arithmetic (``ADD / SUB / MUL`` with a :class:`BitVec`
+    operand). Renders via ``repr`` (e.g. ``(x0 & x1)`` or ``CLZ(x0)``)
+    and evaluates via :meth:`BitVec.eval_at`, which recursively reduces
+    every operand to a concrete int and applies :func:`_apply_bitop`.
+    The non-polynomial bit op fires only at that boundary, matching the
+    :class:`RationalPoly` / :class:`IndicatorPoly` design.
+
+    eml-sr columns stay ``None`` — the single-operator EML family has
+    no bitwise primitive; bit ops live at the FF-dispatch boundary via
+    ``M_BITBIN`` / ``M_BITUN``. ``n_monomials`` reports the AST's node
+    count as a complexity proxy.
+    """
+    row.is_bitvec = True
+    row.poly_expr = repr(bitvec)
+    row.n_monomials = _bitvec_node_count(bitvec)
+
+    try:
+        sym_val = bitvec.eval_at(bindings) if bindings else bitvec.eval_at({})
+    except (KeyError, ValueError):
         sym_val = None
 
     if sym_val is None or numpy_top is None:

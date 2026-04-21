@@ -1267,6 +1267,15 @@ def _as_concrete_int(p: "RationalStackValue") -> Optional[int]:
         if inner is None:
             return None
         return 1 if _relation_holds(p.relation, inner) else 0
+    if isinstance(p, BitVec):
+        # Bit-vector fragment (issue #77). A BitVec with no free
+        # variables reduces to an i32 literal via :meth:`eval_at`, so
+        # JZ/JNZ on it takes the concretely-decided branch rather than
+        # forking. Matches the IndicatorPoly(Poly) path above and
+        # unblocks ``popcount_loop(n)`` at concrete ``n``.
+        if p.variables():
+            return None
+        return int(p.eval_at({}))
     if not isinstance(p, Poly):
         return None
     if not p.terms:
@@ -1371,6 +1380,10 @@ def _branch_guards(cond: "RationalStackValue", op: int) -> Tuple[Guard, Guard]:
         zero_guard = Guard(poly=cond, relation=REL_EQ)
         nonzero_guard = Guard(poly=cond, relation=REL_NE)
     else:
+        # BitVec / RationalPoly / SymbolicRemainder with free variables:
+        # out of scope. Concrete-mode BitVec conds are handled earlier
+        # by :func:`_as_concrete_int` (issue #77); this branch only
+        # fires for truly symbolic non-Poly conds.
         raise SymbolicOpNotSupported(
             f"JZ/JNZ on a {type(cond).__name__} cond is out of scope; "
             "branching past DIV_S/REM_S is a follow-up"

@@ -116,17 +116,17 @@ def test_classify_guarded_on_symbolic_branch():
 
 
 def test_classify_blocks_nonpolynomial_opcode():
-    # PUSH, AND: AND is outside _POLY_OPS (bitwise).
-    # DIV_S / REM_S are in scope per issue #75.
+    # PUSH, ABS: ABS is outside _POLY_OPS (unary absolute value).
+    # DIV_S / REM_S are in scope per issue #75; bitwise ops (AND/OR/XOR/
+    # SHL/SHR_S/SHR_U/CLZ/CTZ/POPCNT) are in scope per issue #77.
     prog = [
-        isa.Instruction(isa.OP_PUSH, 12),
-        isa.Instruction(isa.OP_PUSH, 10),
-        isa.Instruction(isa.OP_AND),
+        isa.Instruction(isa.OP_PUSH, -3),
+        isa.Instruction(isa.OP_ABS),
         isa.Instruction(isa.OP_HALT),
     ]
     cr = classify_program(prog)
     assert cr.status == "blocked_opcode"
-    assert cr.blocker == "AND"
+    assert cr.blocker == "ABS"
 
 
 def test_classify_rational_top_on_div_s():
@@ -158,18 +158,19 @@ def test_classify_rational_top_on_rem_s():
 
 
 def test_classify_first_blocker_wins():
-    # CLZ precedes JZ — non-polynomial opcode is reported even though
+    # ABS precedes JZ — non-polynomial opcode is reported even though
     # control flow also appears further down. (LT_S no longer blocks
-    # as of issue #76 — it collapses to an IndicatorPoly.)
+    # as of issue #76 — it collapses to an IndicatorPoly. CLZ no longer
+    # blocks as of issue #77 — it collapses to a BitVec.)
     prog = [
         isa.Instruction(isa.OP_PUSH, 16),
-        isa.Instruction(isa.OP_CLZ),
+        isa.Instruction(isa.OP_ABS),
         isa.Instruction(isa.OP_JZ, 99),
         isa.Instruction(isa.OP_HALT),
     ]
     cr = classify_program(prog)
     assert cr.status == "blocked_opcode"
-    assert cr.blocker == "CLZ"
+    assert cr.blocker == "ABS"
 
 
 # ─── Comparison opcodes (issue #76) ───────────────────────────────
@@ -241,8 +242,12 @@ def test_run_catalog_default_has_collapsed_and_blocked():
     assert n_collapsed >= 10, f"expected ≥10 collapsed rows, got {n_collapsed}"
     # Floor dropped from ≥5 to ≥4 in issue #76: compare_lt_s + native_max
     # (and compare_eqz on first landing) now classify as collapsed /
-    # collapsed_guarded rather than blocked_opcode.
-    assert n_blocked >= 4, f"expected ≥4 blocked rows, got {n_blocked}"
+    # collapsed_guarded rather than blocked_opcode. Floor dropped again
+    # from ≥4 to ≥2 in issue #77: bitwise AND/OR/XOR/SHL/SHR_S/SHR_U +
+    # CLZ/CTZ/POPCNT + bit_extract + log2_floor + is_power_of_2 +
+    # popcount_loop now classify as collapsed / collapsed_unrolled.
+    # Only ABS and NEG remain as unary non-polynomial blockers.
+    assert n_blocked >= 2, f"expected ≥2 blocked rows, got {n_blocked}"
 
 
 def test_run_catalog_collapsed_rows_numeric_match():
