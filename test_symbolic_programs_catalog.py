@@ -23,7 +23,7 @@ import sys
 import isa
 from executor import NumPyExecutor
 from isa import program
-from symbolic_executor import GuardedPoly, Poly
+from symbolic_executor import GuardedPoly, IndicatorPoly, Poly, REL_EQ, REL_GT, REL_LE, REL_LT
 from symbolic_programs_catalog import (
     _EML_AVAILABLE,
     CatalogEntry,
@@ -33,6 +33,7 @@ from symbolic_programs_catalog import (
     STATUS_COLLAPSED,
     STATUS_COLLAPSED_GUARDED,
     STATUS_COLLAPSED_UNROLLED,
+    _guard_to_expr,
     classify_program,
     poly_to_expr,
     run_catalog,
@@ -157,18 +158,78 @@ def test_classify_rational_top_on_rem_s():
 
 
 def test_classify_first_blocker_wins():
-    # LT_S precedes JZ — non-polynomial opcode is reported even though
-    # control flow also appears further down.
+    # CLZ precedes JZ — non-polynomial opcode is reported even though
+    # control flow also appears further down. (LT_S no longer blocks
+    # as of issue #76 — it collapses to an IndicatorPoly.)
     prog = [
-        isa.Instruction(isa.OP_PUSH, 3),
-        isa.Instruction(isa.OP_PUSH, 5),
-        isa.Instruction(isa.OP_LT_S),
+        isa.Instruction(isa.OP_PUSH, 16),
+        isa.Instruction(isa.OP_CLZ),
         isa.Instruction(isa.OP_JZ, 99),
         isa.Instruction(isa.OP_HALT),
     ]
     cr = classify_program(prog)
     assert cr.status == "blocked_opcode"
-    assert cr.blocker == "LT_S"
+    assert cr.blocker == "CLZ"
+
+
+# ─── Comparison opcodes (issue #76) ───────────────────────────────
+
+def test_classify_compare_lt_s_collapses_to_indicator():
+    """LT_S on symbolic inputs collapses to an IndicatorPoly top."""
+    prog = [
+        isa.Instruction(isa.OP_PUSH, 3),
+        isa.Instruction(isa.OP_PUSH, 5),
+        isa.Instruction(isa.OP_LT_S),
+        isa.Instruction(isa.OP_HALT),
+    ]
+    cr = classify_program(prog)
+    assert cr.status == STATUS_COLLAPSED
+    assert cr.indicator is not None
+    assert isinstance(cr.indicator, IndicatorPoly)
+    assert cr.indicator.relation == REL_LT
+    # diff = vb - va = x0 - x1
+    assert cr.indicator.poly == Poly({((0, 1),): 1, ((1, 1),): -1})
+    assert cr.poly is None and cr.rational is None
+
+
+def test_classify_compare_eqz_collapses_to_indicator():
+    """EQZ on a symbolic input collapses to an IndicatorPoly(poly=x0, REL_EQ)."""
+    prog = [
+        isa.Instruction(isa.OP_PUSH, 0),
+        isa.Instruction(isa.OP_EQZ),
+        isa.Instruction(isa.OP_HALT),
+    ]
+    cr = classify_program(prog)
+    assert cr.status == STATUS_COLLAPSED
+    assert cr.indicator is not None
+    assert cr.indicator.relation == REL_EQ
+    assert cr.indicator.poly == Poly.variable(0)
+
+
+def test_classify_native_max_is_guarded_with_le_gt():
+    """GT_S → JZ → POP/HALT dispatch hoists the comparison's relation
+    into the Guard pair, producing a two-case GuardedPoly with LE/GT
+    guards (not EQ/NE — that was the S1 backward-compat path)."""
+    import programs as P
+    prog, expected = P.make_native_max(3, 5)
+    cr = classify_program(prog)
+    assert cr.status == STATUS_COLLAPSED_GUARDED
+    assert cr.guarded is not None
+    assert cr.n_cases == 2
+    relations = {g.relation for gs, _ in cr.guarded.cases for g in gs}
+    assert relations == {REL_LE, REL_GT}
+
+
+def test_guard_to_expr_renders_full_relation_set():
+    """Render all six relation symbols correctly."""
+    from symbolic_executor import Guard, REL_EQ, REL_NE, REL_LT, REL_LE, REL_GT, REL_GE
+    p = Poly.variable(0)
+    assert _guard_to_expr(Guard(poly=p, relation=REL_EQ)) == "x0 == 0"
+    assert _guard_to_expr(Guard(poly=p, relation=REL_NE)) == "x0 != 0"
+    assert _guard_to_expr(Guard(poly=p, relation=REL_LT)) == "x0 < 0"
+    assert _guard_to_expr(Guard(poly=p, relation=REL_LE)) == "x0 <= 0"
+    assert _guard_to_expr(Guard(poly=p, relation=REL_GT)) == "x0 > 0"
+    assert _guard_to_expr(Guard(poly=p, relation=REL_GE)) == "x0 >= 0"
 
 
 # ─── run_catalog — end-to-end pipeline ────────────────────────────
@@ -178,7 +239,10 @@ def test_run_catalog_default_has_collapsed_and_blocked():
     n_collapsed = sum(1 for r in rows if r.status == "collapsed")
     n_blocked = sum(1 for r in rows if r.status.startswith("blocked"))
     assert n_collapsed >= 10, f"expected ≥10 collapsed rows, got {n_collapsed}"
-    assert n_blocked >= 5, f"expected ≥5 blocked rows, got {n_blocked}"
+    # Floor dropped from ≥5 to ≥4 in issue #76: compare_lt_s + native_max
+    # (and compare_eqz on first landing) now classify as collapsed /
+    # collapsed_guarded rather than blocked_opcode.
+    assert n_blocked >= 4, f"expected ≥4 blocked rows, got {n_blocked}"
 
 
 def test_run_catalog_collapsed_rows_numeric_match():
@@ -226,6 +290,39 @@ def test_run_catalog_pins_guarded_rows():
     assert rows["either_or(3,7,1)"].n_cases == 2
     assert rows["either_or(3,7,1)"].numpy_top == 7
     assert rows["either_or(3,7,1)"].numeric_match is True
+
+
+def test_run_catalog_pins_comparison_rows():
+    """Issue #76 pins: comparison rows move from blocked_opcode to
+    collapsed (LT_S, EQZ) / collapsed_guarded (native_max with GT_S+JZ
+    dispatch). All three numeric-match at the catalog's concrete inputs.
+    """
+    rows = {r.name: r for r in run_catalog()}
+
+    r = rows["compare_lt_s(3,5)"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.is_indicator is True
+    assert r.poly_expr == "[x0 - x1 < 0]"
+    assert r.numpy_top == 1  # 3 < 5 → 1
+    assert r.numeric_match is True
+    # eml-sr has no sign primitive — indicator rows skip the eml columns.
+    assert r.eml_size is None and r.eml_depth is None
+
+    r = rows["compare_eqz(0)"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.is_indicator is True
+    assert r.poly_expr == "[x0 == 0]"
+    assert r.numpy_top == 1  # 0 == 0 → 1
+    assert r.numeric_match is True
+
+    r = rows["native_max(3,5)"]
+    assert r.status == STATUS_COLLAPSED_GUARDED
+    assert r.n_cases == 2
+    assert r.numpy_top == 5
+    assert r.numeric_match is True
+    # Both branches render with LE / GT relation symbols.
+    joined = " ; ".join(r.case_exprs or [])
+    assert " <= 0" in joined and " > 0" in joined
 
 
 def test_run_catalog_pins_unrolled_rows():
