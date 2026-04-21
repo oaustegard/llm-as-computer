@@ -40,6 +40,7 @@ from symbolic_executor import (
     BitVec,
     GuardedPoly,
     IndicatorPoly,
+    ModPoly,
     Poly,
     RationalPoly,
     REL_EQ,
@@ -1019,6 +1020,330 @@ def test_bitvec_parameter_count():
 
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
+# ─── ModPoly / mod-2³² equivalence (issue #78 option (b)) ────────
+#
+# Issue #78 asks for the equivalence theorem to be "honest about i32
+# wrap" — either pin the range (#69 Option (a), already landed) or
+# carry wrap semantics in the algebra (Option (b)). These tests
+# exercise Option (b): ``ModPoly`` closes the ``& MASK32`` gap by
+# reducing coefficients modulo 2³² after every ADD/SUB/MUL, so the
+# equivalence becomes *structural over ℤ/2³²* — not just numeric on
+# in-range inputs.
+#
+# Coverage:
+#   1. Primitives on ``ModPoly`` + mod-32 symbolic primitives wrap
+#      correctly at the 32-bit boundary.
+#   2. Every pure-Poly collapsed catalog row has
+#      ``ModPoly.from_poly(run_symbolic(P).top) == evaluate_program_mod(P).top``.
+#   3. Two overflow-stressing programs where the ℤ result doesn't fit
+#      in i32 still match NumPyExecutor bit-for-bit under wrap.
+#   4. Ring-homomorphism check: the lift of the Poly-over-ℤ driver's
+#      output equals the mod-32 driver's output on every catalog row.
+#   5. Blocked opcodes outside the polynomial fragment (DIV_S, JZ,
+#      comparisons, bitwise) raise ``BlockedOpcodeForSymbolic`` from
+#      ``evaluate_program_mod`` rather than silently returning a
+#      ModPoly that doesn't carry the wrap semantics of the boundary
+#      wrappers.
+
+
+def test_modpoly_primitives():
+    """ModPoly constructors, arithmetic, wrap behaviour."""
+    # Constants wrap cleanly.
+    _check("ModPoly.constant(0) == empty", ModPoly.constant(0) == ModPoly({}))
+    _check("ModPoly.constant(2**32) == 0",
+           ModPoly.constant(1 << 32) == ModPoly.constant(0))
+    _check("ModPoly.constant(-1) == MASK32",
+           ModPoly.constant(-1) == ModPoly.constant(0xFFFFFFFF))
+
+    # Variables are the same shape as Poly's.
+    x0 = ModPoly.variable(0)
+    x1 = ModPoly.variable(1)
+    _check("variable structure",
+           x0.terms == {((0, 1),): 1})
+
+    # Addition wraps at the coefficient level.
+    big = ModPoly.constant(0xFFFFFFFF)
+    one = ModPoly.constant(1)
+    _check("MASK32 + 1 wraps to 0", (big + one) == ModPoly.constant(0))
+
+    # Subtraction produces a canonical unsigned form.
+    _check("0 - 1 == MASK32",
+           (ModPoly.constant(0) - ModPoly.constant(1))
+           == ModPoly.constant(0xFFFFFFFF))
+
+    # Negation.
+    _check("neg(1) == MASK32",
+           (-ModPoly.constant(1)) == ModPoly.constant(0xFFFFFFFF))
+
+    # Multiplication wraps. 100_000 * 100_000 = 10**10 ≡ 1_410_065_408 (mod 2³²).
+    hundred_k = ModPoly.constant(100_000)
+    _check("100k * 100k wraps",
+           (hundred_k * hundred_k) == ModPoly.constant(1_410_065_408))
+
+    # 2¹⁶ squared is 2³², which is 0 mod 2³². Structural witness of the
+    # zero-divisor behaviour ℤ/2³² exhibits.
+    sixteen_bit = ModPoly.constant(1 << 16)
+    _check("2^16 * 2^16 == 0 mod 2^32",
+           (sixteen_bit * sixteen_bit) == ModPoly.constant(0))
+
+    # eval_at matches a native & MASK32 on an out-of-range value.
+    sq = ModPoly.variable(0) * ModPoly.variable(0)
+    _check("eval_at wraps 46341^2",
+           sq.eval_at({0: 46341}) == (46341 * 46341) & 0xFFFFFFFF)
+    _check("eval_at_signed on overflow",
+           sq.eval_at_signed({0: 46341}) == -2_147_479_015)
+    _check("eval_at handles negative binding",
+           sq.eval_at({0: -1}) == 1)
+
+
+def test_symbolic_primitives_mod():
+    """ff.symbolic_{add,sub,mul}_mod = ModPoly +/−/*, order matches numeric."""
+    a = ModPoly.variable(0)
+    b = ModPoly.variable(1)
+    _check("symbolic_add_mod", ff.symbolic_add_mod(a, b) == a + b)
+    # SUB order: forward_sub returns b - a (pa = top = a; pb = SP-1 = b).
+    _check("symbolic_sub_mod order", ff.symbolic_sub_mod(a, b) == b - a)
+    _check("symbolic_mul_mod", ff.symbolic_mul_mod(a, b) == a * b)
+
+    # Composition reduces at every step — the homomorphism property.
+    # Building (x+y)² symbolically with constants near the boundary:
+    # coefficients stay within [0, 2³²) after every intermediate step.
+    k = ModPoly.constant(0xFFFF_FFFE)  # -2 (mod 2³²)
+    _check("compose: k + 2 == 0 mod 2^32",
+           (ff.symbolic_add_mod(k, ModPoly.constant(2))) == ModPoly.constant(0))
+
+
+def _collapsed_poly_entries():
+    """Catalog rows whose ``run_symbolic.top`` is a plain ``Poly``.
+
+    That's the subset where ModPoly's scope applies directly. Other
+    collapsed rows (RationalPoly / IndicatorPoly / BitVec) have their
+    own boundary wrap handled inside those wrappers' ``eval_at`` and
+    are out of scope for the mod-2³² algebra.
+    """
+    out = []
+    for entry in _default_catalog():
+        cr = classify_program(entry.prog)
+        if cr.status == STATUS_COLLAPSED and cr.poly is not None:
+            out.append(entry)
+    return out
+
+
+def test_modpoly_catalog_structural():
+    """For every pure-Poly collapsed row:
+
+    ``ModPoly.from_poly(run_symbolic(P).top) == evaluate_program_mod(P).top``.
+
+    Structural equality in ℤ/2³², not merely numerical — the canonical
+    term dict matches after mod-32 reduction. This is the honest
+    equivalence theorem option (b) asks for.
+    """
+    entries = _collapsed_poly_entries()
+    _check("mod32 catalog has rows", len(entries) > 0,
+           f"expected >0, got {len(entries)}")
+    for entry in entries:
+        sym = run_symbolic(entry.prog)
+        if not isinstance(sym.top, Poly):
+            continue
+        lifted = ModPoly.from_poly(sym.top)
+        mod_res = ff.evaluate_program_mod(entry.prog)
+        _check(
+            f"mod32.struct[{entry.name}]",
+            lifted == mod_res.top,
+            f"lifted={lifted!r} mod={mod_res.top!r}",
+        )
+        _check(
+            f"mod32.n_heads[{entry.name}]",
+            sym.n_heads == mod_res.n_heads,
+            f"sym={sym.n_heads}, mod={mod_res.n_heads}",
+        )
+
+
+def test_modpoly_homomorphism_on_catalog():
+    """Ring-homomorphism witness on every collapsed row.
+
+    ``ModPoly.from_poly(evaluate_program(P).top) == evaluate_program_mod(P).top``
+    — lifting commutes with the driver. The one-liner proof is that
+    each primitive (``symbolic_{add,sub,mul}`` and ``_mod`` variants)
+    reduces to the same coefficient-level operation, just in a
+    different ring. The test asserts it actually holds programmatically.
+    """
+    for entry in _collapsed_poly_entries():
+        poly_res = ff.evaluate_program(entry.prog)
+        if not isinstance(poly_res.top, Poly):
+            continue
+        lifted = ModPoly.from_poly(poly_res.top)
+        mod_res = ff.evaluate_program_mod(entry.prog)
+        _check(
+            f"mod32.homo[{entry.name}]",
+            lifted == mod_res.top,
+            f"lifted={lifted!r} mod={mod_res.top!r}",
+        )
+
+
+def test_modpoly_catalog_numeric():
+    """Evaluate the mod-32 top at catalog bindings — match NumPyExecutor.
+
+    Unlike ``test_equivalence_numeric`` (which asserts over ℤ and
+    requires the value to clear ``range_check``), this evaluates in
+    ℤ/2³² directly — the sides agree by construction, range_check
+    notwithstanding.
+    """
+    np_exec = NumPyExecutor()
+    for entry in _collapsed_poly_entries():
+        mod = ff.evaluate_program_mod(entry.prog)
+        mod_val = mod.top.eval_at(mod.bindings) if mod.bindings else mod.top.eval_at({})
+        np_trace = np_exec.execute(entry.prog)
+        np_top = np_trace.steps[-1].top if np_trace.steps else None
+        # NumPyExecutor stores u32-masked values; ModPoly.eval_at returns u32.
+        _check(
+            f"mod32.numeric[{entry.name}]",
+            mod_val == (int(np_top) & 0xFFFFFFFF),
+            f"mod={mod_val}, np={np_top}",
+        )
+
+
+def test_modpoly_overflow_stress():
+    """Two overflow-stressing cases where ℤ and ℤ/2³² disagree.
+
+    Issue #78 explicitly calls these out as the missing coverage under
+    Option (a): "Today's tests live inside the range where both sides
+    agree, so a bug in either direction would pass silently." Each
+    program here has an honest value > I32_MAX that only agrees with
+    the native path under i32 wrap.
+
+    Three-way check per case: run_symbolic over ℤ (out of range; fails
+    range_check), evaluate_program_mod (in ℤ/2³²), NumPyExecutor
+    (masked). ModPoly ≡ NumPy bit-for-bit; ℤ-evaluated Poly disagrees.
+    """
+    np_exec = NumPyExecutor()
+
+    # Case 1: MUL on sqrt(I32_MAX)-ish inputs. 46341² = 2_147_488_281
+    # overflows signed i32 (I32_MAX = 2_147_483_647) by 4_634. Stays in
+    # u32, so NumPyExecutor's masked u32 view matches the unmasked ℤ
+    # value here — but the *signed* reading differs, and the structure
+    # of the test is to show ModPoly is the one that agrees with
+    # NumPyExecutor under ALL i32 inputs, not just in-range ones.
+    prog1 = program(
+        ("PUSH", 46341), ("DUP",), ("MUL",), ("HALT",),
+    )
+    sym1 = run_symbolic(prog1)
+    mod1 = ff.evaluate_program_mod(prog1)
+    np1 = np_exec.execute(prog1).steps[-1].top
+    mod_val1 = mod1.top.eval_at(mod1.bindings)
+    z_val1 = sym1.top.eval_at(sym1.bindings)
+    _check(
+        "overflow[46341^2].modpoly==numpy",
+        mod_val1 == (int(np1) & 0xFFFFFFFF),
+        f"mod={mod_val1}, np={np1}",
+    )
+    _check(
+        "overflow[46341^2].z_matches_too",
+        z_val1 == 46341 * 46341,
+        f"z={z_val1}",
+    )
+    # The diagnostic: ℤ value is still equal to masked u32 here (2_147_488_281
+    # < 2³² = 4_294_967_296), so both interpretations happen to agree.
+    # range_check rejects it though.
+    try:
+        ff.range_check(z_val1, context="46341^2")
+        _fail("overflow[46341^2].range_rejects", "range_check accepted overflow")
+    except ff.RangeCheckFailure:
+        _pass("overflow[46341^2].range_rejects")
+
+    # Case 2: MUL beyond u32. 100_000 * 100_000 = 10¹⁰ > 2³² (= 4_294_967_296).
+    # ℤ-evaluated Poly = 10_000_000_000; ℤ/2³² = 1_410_065_408 = NumPy's
+    # masked top. ModPoly is the only side that agrees with NumPyExecutor.
+    prog2 = program(
+        ("PUSH", 100_000), ("PUSH", 100_000), ("MUL",), ("HALT",),
+    )
+    sym2 = run_symbolic(prog2)
+    mod2 = ff.evaluate_program_mod(prog2)
+    np2 = np_exec.execute(prog2).steps[-1].top
+    mod_val2 = mod2.top.eval_at(mod2.bindings)
+    z_val2 = sym2.top.eval_at(sym2.bindings)
+    _check(
+        "overflow[100k*100k].modpoly==numpy",
+        mod_val2 == (int(np2) & 0xFFFFFFFF),
+        f"mod={mod_val2}, np={np2}",
+    )
+    _check(
+        "overflow[100k*100k].z_disagrees",
+        z_val2 != (int(np2) & 0xFFFFFFFF) and z_val2 == 10_000_000_000,
+        f"z={z_val2}, np={np2}",
+    )
+
+    # Case 3 (bonus): 2¹⁶ squared = 2³² ≡ 0 (mod 2³²). Zero-divisor
+    # witness inside ℤ/2³²; NumPyExecutor also reports 0.
+    prog3 = program(
+        ("PUSH", 1 << 16), ("DUP",), ("MUL",), ("HALT",),
+    )
+    mod3 = ff.evaluate_program_mod(prog3)
+    np3 = np_exec.execute(prog3).steps[-1].top
+    _check(
+        "overflow[2^16 squared == 0]",
+        mod3.top.eval_at(mod3.bindings) == 0 and (int(np3) & 0xFFFFFFFF) == 0,
+        f"mod={mod3.top.eval_at(mod3.bindings)}, np={np3}",
+    )
+
+    # Case 4 (bonus): ADD that overflows. I32_MAX + 2 = -I32_MAX (signed wrap).
+    # We do it via PUSHes that themselves exceed i31; evaluate_program_mod
+    # still produces x0 + x1 symbolically (coefficients unchanged) — the
+    # wrap happens at eval_at.
+    prog4 = program(
+        ("PUSH", 0x7FFFFFFF), ("PUSH", 2), ("ADD",), ("HALT",),
+    )
+    mod4 = ff.evaluate_program_mod(prog4)
+    np4 = np_exec.execute(prog4).steps[-1].top
+    _check(
+        "overflow[I32_MAX + 2].modpoly==numpy",
+        mod4.top.eval_at(mod4.bindings) == (int(np4) & 0xFFFFFFFF),
+        f"mod={mod4.top.eval_at(mod4.bindings)}, np={np4}",
+    )
+
+
+def test_modpoly_blocked_opcodes():
+    """Ops outside the polynomial-closed fragment raise in evaluate_program_mod.
+
+    ModPoly is deliberately narrower than ``evaluate_program`` — its
+    scope is the ring (ADD/SUB/MUL + stack manip). Everything else
+    (comparisons, rationals, bit-ops) keeps its own boundary wrap and
+    must NOT silently become a ModPoly lacking those semantics.
+    """
+    # DIV_S — rational fragment has its own boundary (RationalPoly).
+    prog = program(("PUSH", 10), ("PUSH", 3), ("DIV_S",), ("HALT",))
+    try:
+        ff.evaluate_program_mod(prog)
+        _fail("mod32.blocked[DIV_S]", "expected BlockedOpcodeForSymbolic")
+    except ff.BlockedOpcodeForSymbolic:
+        _pass("mod32.blocked[DIV_S]")
+
+    # LT_S — comparison gate, not polynomial.
+    prog = program(("PUSH", 3), ("PUSH", 5), ("LT_S",), ("HALT",))
+    try:
+        ff.evaluate_program_mod(prog)
+        _fail("mod32.blocked[LT_S]", "expected BlockedOpcodeForSymbolic")
+    except ff.BlockedOpcodeForSymbolic:
+        _pass("mod32.blocked[LT_S]")
+
+    # AND — bitwise, lives in BitVec AST.
+    prog = program(("PUSH", 5), ("PUSH", 3), ("AND",), ("HALT",))
+    try:
+        ff.evaluate_program_mod(prog)
+        _fail("mod32.blocked[AND]", "expected BlockedOpcodeForSymbolic")
+    except ff.BlockedOpcodeForSymbolic:
+        _pass("mod32.blocked[AND]")
+
+    # JZ — control flow; the mod-32 driver is straight-line like its
+    # Poly-over-ℤ sibling.
+    prog = program(("PUSH", 1), ("JZ", 10), ("HALT",))
+    try:
+        ff.evaluate_program_mod(prog)
+        _fail("mod32.blocked[JZ]", "expected BlockedOpcodeForSymbolic")
+    except ff.BlockedOpcodeForSymbolic:
+        _pass("mod32.blocked[JZ]")
+
+
 def test_blocked_opcodes():
     """Ops outside the fragment raise BlockedOpcodeForSymbolic.
 
@@ -1099,6 +1424,13 @@ def main():
         test_equivalence_is_power_of_2_structural,
         test_equivalence_bitvec_numeric,
         test_bitvec_parameter_count,
+        test_modpoly_primitives,
+        test_symbolic_primitives_mod,
+        test_modpoly_catalog_structural,
+        test_modpoly_homomorphism_on_catalog,
+        test_modpoly_catalog_numeric,
+        test_modpoly_overflow_stress,
+        test_modpoly_blocked_opcodes,
         test_blocked_opcodes,
     ]
     print("=" * 60)
