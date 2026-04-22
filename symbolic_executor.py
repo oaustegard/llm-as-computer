@@ -1750,7 +1750,8 @@ def run_forking(prog: List[isa.Instruction], *,
                 input_mode: str = "symbolic",
                 max_paths: int = DEFAULT_MAX_PATHS,
                 max_steps: int = DEFAULT_MAX_STEPS,
-                arithmetic_ops: Optional[ArithmeticOps] = None) -> ForkingResult:
+                arithmetic_ops: Optional[ArithmeticOps] = None,
+                solve_recurrences: bool = True) -> ForkingResult:
     """Forking symbolic executor with finite-conditional + bounded-loop support.
 
     ``input_mode``:
@@ -1766,15 +1767,28 @@ def run_forking(prog: List[isa.Instruction], *,
     interpretation here (issue #68 S3) to demonstrate equivalence across
     control flow.
 
+    ``solve_recurrences`` (issue #89): when ``True`` (default), paths
+    that would otherwise halt with ``loop_symbolic`` are routed through
+    :func:`_try_solve_recurrence`. On success the loop is replaced with
+    a single closed-form halted path carrying a :class:`Poly` /
+    :class:`ClosedForm` / :class:`ProductForm` top; the status becomes
+    ``"closed_form"``. On failure the path falls through to the
+    unchanged ``loop_symbolic`` behaviour. Set to ``False`` to reproduce
+    the pre-#89 ``blocked_loop_symbolic`` path exactly.
+
     The executor uses a worklist. Each fork splits the path into two new
     paths carrying complementary guards. When a path's top polynomial is
     concrete at a branch, the branch is followed deterministically. A
     symbolic back-edge that revisits ``(pc, sp)`` halts the path with
-    ``loop_symbolic``.
+    ``loop_symbolic`` (unless ``solve_recurrences`` catches it first).
     """
     if input_mode not in ("symbolic", "concrete"):
         raise ValueError(f"unknown input_mode {input_mode!r}")
     ops = arithmetic_ops if arithmetic_ops is not None else DEFAULT_ARITHMETIC_OPS
+    # Closed-form paths accumulate here when `_try_solve_recurrence`
+    # succeeds at a back-edge revisit; they're merged alongside
+    # ``halted`` at the end and flipped to status="closed_form".
+    closed_form_paths: List[_Path] = []
 
     # Pre-flight: reject programs with non-polynomial, non-branch opcodes.
     for instr in prog:
@@ -1882,8 +1896,34 @@ def run_forking(prog: List[isa.Instruction], *,
                 # Symbolic condition → fork. Check for symbolic back-edge revisit.
                 site = (path.pc, sp, op)
                 if is_back_edge and site in path.visited_branches:
-                    # This path already forked at this back-edge once with a
-                    # symbolic cond — seeing it again means no progress.
+                    # This path already forked at this back-edge once with
+                    # a symbolic cond — seeing it again means no progress.
+                    # Issue #89: before halting with loop_symbolic, try
+                    # to derive a closed form for the loop.
+                    closed_top = None
+                    if solve_recurrences:
+                        # Re-attach cond to the stack for the solver so
+                        # its "back-edge state" view matches the
+                        # executor's (``path`` here already popped the
+                        # cond above).
+                        solver_path = path.with_(
+                            stack=path.stack + (cond,),
+                        )
+                        closed_top = _try_solve_recurrence(
+                            prog, solver_path, input_mode, ops,
+                        )
+                    if closed_top is not None:
+                        # Replace the loop with a single closed-form
+                        # halted path. Guards stay empty — the closed
+                        # form covers all iteration counts, so prior
+                        # iteration-specific halts are subsumed.
+                        closed_path = path.with_(
+                            halted_top=closed_top,
+                            n_heads=path.n_heads,
+                            guards=(),
+                        )
+                        closed_form_paths.append(closed_path)
+                        break
                     loop_symbolic_paths.append(path)
                     break
                 new_visited = path.visited_branches | {site}
@@ -1910,8 +1950,41 @@ def run_forking(prog: List[isa.Instruction], *,
         # Collect what we have and report.
         return ForkingResult(
             top=None, status="path_explosion",
-            n_heads=max((p.n_heads for p in halted + loop_symbolic_paths), default=0),
+            n_heads=max(
+                (p.n_heads for p in halted + loop_symbolic_paths
+                 + closed_form_paths),
+                default=0,
+            ),
             bindings={}, n_halted=len(halted),
+            n_loop_symbolic=len(loop_symbolic_paths),
+            paths_explored=paths_explored,
+        )
+
+    # Issue #89: closed-form halted paths. When the solver fires, the
+    # closed-form top covers all iteration counts of the loop, which
+    # subsumes the iteration-specific halts produced before the
+    # back-edge revisit. Keeping the per-iteration halted paths
+    # alongside the closed form would duplicate signal and force the
+    # output into a GuardedPoly — so we treat ``closed_form_paths`` as
+    # the authoritative output whenever it's non-empty.
+    if closed_form_paths:
+        # Merge bindings from every path (pre-loop prefix state is
+        # already baked into the closed form, but other paths may carry
+        # bindings the caller wants for the three-way eval check).
+        merged_bindings: Dict[int, int] = {}
+        for p in closed_form_paths + halted + loop_symbolic_paths:
+            merged_bindings.update(p.bindings)
+        cf_tops = {p.halted_top for p in closed_form_paths}
+        if len(cf_tops) == 1:
+            top_val: Union[Poly, GuardedPoly, ClosedForm, ProductForm] = next(iter(cf_tops))
+        else:
+            # Multiple distinct closed forms — shouldn't happen for the
+            # single-loop catalog programs, but fall back to the first.
+            top_val = closed_form_paths[0].halted_top
+        n_heads = max((p.n_heads for p in closed_form_paths), default=0)
+        return ForkingResult(
+            top=top_val, status="closed_form", n_heads=n_heads,
+            bindings=merged_bindings, n_halted=len(closed_form_paths),
             n_loop_symbolic=len(loop_symbolic_paths),
             paths_explored=paths_explored,
         )
@@ -1949,7 +2022,7 @@ def run_forking(prog: List[isa.Instruction], *,
     # Build the top: a single Poly if all agree and no guards, else GuardedPoly.
     unique_values = {v for _, v in tops}
     if not any_forked and len(unique_values) == 1:
-        top_val: Union[Poly, GuardedPoly] = next(iter(unique_values))
+        top_val = next(iter(unique_values))
     else:
         top_val = _build_guarded_poly(tops)
 
@@ -2193,6 +2266,641 @@ def _build_guarded_poly(
         for gs in guard_chains:
             cases.append((gs, value))
     return GuardedPoly(cases=tuple(cases))
+
+
+# ─── Loop-invariant inference (issue #89) ────────────────────────
+#
+# The pipeline outlined in ``dev/loop_invariant_inference.md``:
+#
+#   1. Detect the back-edge that triggered loop_symbolic. The target of
+#      that JZ/JNZ is the loop header.
+#   2. Re-execute the program prefix (pc=0..loop_header_pc-1) straight-
+#      line to recover the initial loop state.
+#   3. Execute one body iteration starting at loop_header_pc with fresh
+#      "slot" variables for each loop-carried stack entry, following
+#      "stay in loop" decisions at any JZ/JNZ inside the body. The
+#      transition polynomials fall out as the stack at back_edge_pc.
+#   4. Classify:
+#        - Tier 1 — affine with a polynomial driver in the counter.
+#          Closed form stays in :class:`Poly` (Faulhaber).
+#        - Tier 2 — linear map with constant integer coefficients on
+#          the dependent slots. Emits :class:`ClosedForm`.
+#        - Tier 3 — ``acc <- acc * p(counter)`` with linear counter
+#          decrement. Emits :class:`ProductForm`.
+#
+# Keeping the solver self-contained below ``_build_guarded_poly`` so
+# ``run_forking`` only carries a single hook site — no entanglement
+# with the forking driver's worklist / guard machinery.
+
+
+# Slot variables for the fresh loop-carried inputs. High indices so
+# they never collide with real PC-indexed variables.
+_SLOT_VAR_BASE = 1_000_000
+
+
+def _substitute_poly(poly: Poly, subs: Mapping[int, int]) -> Poly:
+    """Partial substitution: replace ``x_v`` with ``subs[v]`` for each
+    ``v in subs``; leave other variables symbolic.
+
+    Returns a new :class:`Poly`. Used to fold body-local PUSH
+    constants (the ``PUSH 1; SUB`` / ``PUSH 1; JNZ`` sites inside a
+    loop body) into the transition polynomials so the classifier sees
+    clean expressions in the slot variables alone.
+    """
+    out: Dict[Monomial, Union[int, Fraction]] = {}
+    for mono, coeff in poly.terms.items():
+        new_mono: List[Tuple[int, int]] = []
+        factor: Union[int, Fraction] = 1
+        for v, p in mono:
+            if v in subs:
+                factor *= subs[v] ** p
+            else:
+                new_mono.append((v, p))
+        key = tuple(new_mono)
+        out[key] = out.get(key, 0) + coeff * factor
+    return Poly(out)
+
+
+def _run_prefix(prog: List[isa.Instruction], end_pc: int,
+                input_mode: str,
+                ops: ArithmeticOps
+                ) -> Optional[Tuple[Tuple["RationalStackValue", ...], Dict[int, int]]]:
+    """Straight-line execute ``prog[:end_pc]`` and return ``(stack, bindings)``.
+
+    Returns ``None`` if the prefix contains a symbolic JZ/JNZ (can't
+    unambiguously enter the loop header) or raises underflow. Concrete
+    JZ/JNZ (e.g. PUSH k; JNZ target) are followed deterministically.
+    """
+    path = _Path(
+        pc=0, stack=(), guards=(),
+        bindings={}, n_heads=0,
+        visited_branches=frozenset(), loop_unrolled=False,
+    )
+    steps = 0
+    while path.pc < end_pc and path.pc < len(prog):
+        steps += 1
+        if steps > 10_000:
+            return None
+        instr = prog[path.pc]
+        op = instr.op
+        if op == isa.OP_HALT:
+            return None
+        if op not in (isa.OP_JZ, isa.OP_JNZ):
+            try:
+                stack = _apply_poly_op(path, instr, input_mode, ops)
+            except (SymbolicStackUnderflow, SymbolicOpNotSupported):
+                return None
+            new_bindings = path.bindings
+            if op == isa.OP_PUSH and input_mode == "symbolic":
+                new_bindings = dict(path.bindings)
+                new_bindings[path.pc] = int(instr.arg)
+            path = path.with_(
+                pc=path.pc + 1,
+                stack=stack,
+                bindings=new_bindings,
+                n_heads=path.n_heads + (0 if op == isa.OP_NOP else 1),
+            )
+            continue
+        # JZ / JNZ: only concrete conds are OK in a prefix.
+        if not path.stack:
+            return None
+        cond = path.stack[-1]
+        popped = path.stack[:-1]
+        path = path.with_(stack=popped, n_heads=path.n_heads + 1)
+        concrete = _as_concrete_int(cond)
+        if concrete is None:
+            # Try one more resolution: substitute current bindings, then
+            # check for constancy. Handles ``PUSH 1; JNZ`` in symbolic
+            # mode where the PUSH allocated a var bound to 1.
+            if isinstance(cond, Poly):
+                resolved = _substitute_poly(cond, path.bindings)
+                if not resolved.variables():
+                    concrete = int(resolved.eval_at({}))
+        if concrete is None:
+            return None  # symbolic branch in prefix — out of scope
+        taken = (concrete == 0) if op == isa.OP_JZ else (concrete != 0)
+        path = path.with_(pc=int(instr.arg) if taken else path.pc + 1)
+    if path.pc != end_pc:
+        return None
+    return tuple(path.stack), dict(path.bindings)
+
+
+def _run_body_iteration(
+    prog: List[isa.Instruction],
+    loop_header_pc: int,
+    back_edge_pc: int,
+    n_slots: int,
+    input_mode: str,
+    ops: ArithmeticOps,
+) -> Optional[Tuple[Tuple["RationalStackValue", ...], Dict[int, int]]]:
+    """Execute one loop body from ``loop_header_pc`` with ``n_slots``
+    fresh slot variables as the initial stack.
+
+    Returns ``(transition_stack, body_bindings)`` where
+    ``transition_stack`` is the stack just after the back-edge cond
+    has been popped (so its length is ``n_slots`` again, describing
+    the updated loop-carried slice), or ``None`` if the body can't be
+    closed (symbolic branch inside the loop that isn't the back-edge,
+    non-trivial exit shape, etc.).
+
+    ``body_bindings`` maps every PC-indexed PUSH inside the body to
+    its concrete arg value so the caller can substitute them out.
+    """
+    if loop_header_pc >= back_edge_pc or back_edge_pc >= len(prog):
+        return None
+    back_edge_op = prog[back_edge_pc].op
+    if back_edge_op not in (isa.OP_JZ, isa.OP_JNZ):
+        return None
+
+    # Fresh slot variables — high PC-free indices.
+    init_stack: Tuple["RationalStackValue", ...] = tuple(
+        Poly.variable(_SLOT_VAR_BASE + i) for i in range(n_slots)
+    )
+    path = _Path(
+        pc=loop_header_pc, stack=init_stack, guards=(),
+        bindings={}, n_heads=0,
+        visited_branches=frozenset(), loop_unrolled=False,
+    )
+
+    def _resolve_concrete(cond: "RationalStackValue",
+                          bindings: Dict[int, int]) -> Optional[int]:
+        c = _as_concrete_int(cond)
+        if c is not None:
+            return c
+        if isinstance(cond, Poly):
+            resolved = _substitute_poly(cond, bindings)
+            if not resolved.variables():
+                return int(resolved.eval_at({}))
+        return None
+
+    steps = 0
+    while True:
+        steps += 1
+        if steps > 10_000:
+            return None
+        if path.pc == back_edge_pc:
+            # Body complete: the back-edge's cond is on top, pop it
+            # and return the slot transition.
+            if not path.stack:
+                return None
+            cond = path.stack[-1]
+            resolved = _resolve_concrete(cond, path.bindings)
+            # We must be guaranteed to take the back-edge (else this
+            # isn't a fixed-shape loop). PUSH k; JZ back when k == 0,
+            # PUSH k; JNZ back when k != 0. If the cond doesn't
+            # resolve to the "take" value, inference fails.
+            if resolved is None:
+                return None
+            taken = (resolved == 0) if back_edge_op == isa.OP_JZ else (resolved != 0)
+            if not taken:
+                return None
+            trans_stack = path.stack[:-1]
+            if len(trans_stack) != n_slots:
+                # Stack depth must be preserved across one iteration.
+                return None
+            return trans_stack, dict(path.bindings)
+        if path.pc < 0 or path.pc >= len(prog):
+            return None
+        instr = prog[path.pc]
+        op = instr.op
+        if op == isa.OP_HALT:
+            return None
+        if op not in (isa.OP_JZ, isa.OP_JNZ):
+            try:
+                stack = _apply_poly_op(path, instr, input_mode, ops)
+            except (SymbolicStackUnderflow, SymbolicOpNotSupported):
+                return None
+            new_bindings = path.bindings
+            if op == isa.OP_PUSH and input_mode == "symbolic":
+                new_bindings = dict(path.bindings)
+                new_bindings[path.pc] = int(instr.arg)
+            path = path.with_(
+                pc=path.pc + 1,
+                stack=stack,
+                bindings=new_bindings,
+                n_heads=path.n_heads + (0 if op == isa.OP_NOP else 1),
+            )
+            continue
+        # JZ/JNZ inside the body (pc < back_edge_pc): must be the
+        # exit test. Always take the "stay in loop" branch.
+        if not path.stack:
+            return None
+        cond = path.stack[-1]
+        popped = path.stack[:-1]
+        path = path.with_(stack=popped, n_heads=path.n_heads + 1)
+        target = int(instr.arg)
+        fall_through = path.pc + 1
+        concrete = _resolve_concrete(cond, path.bindings)
+        if concrete is not None:
+            taken = (concrete == 0) if op == isa.OP_JZ else (concrete != 0)
+            path = path.with_(pc=target if taken else fall_through)
+            continue
+        # Symbolic exit: pick the branch that stays inside the loop body.
+        in_range = lambda p: loop_header_pc <= p < back_edge_pc + 1
+        if op == isa.OP_JZ:
+            # JZ takes when cond == 0 (exit); skip stays in loop.
+            stay_pc = fall_through if in_range(fall_through) else target
+        else:
+            # JNZ takes when cond != 0. For the exit test inside a
+            # loop, the "take" direction is usually the continue-loop
+            # direction. Pick whichever target is inside the body.
+            stay_pc = target if in_range(target) else fall_through
+        if not in_range(stay_pc):
+            return None
+        path = path.with_(pc=stay_pc)
+
+
+def _extract_linear(poly: Poly, slot_vars: List[int]
+                    ) -> Optional[Tuple[Dict[int, int], int]]:
+    """If ``poly`` is affine in ``slot_vars`` with integer coefficients,
+    return ``(coeffs, const)`` where ``coeffs[v]`` is the coefficient
+    on slot ``v`` and ``const`` is the constant term. Otherwise
+    return ``None``.
+
+    Any monomial with non-slot variables, non-integer coefficients,
+    or degree > 1 in slot vars disqualifies — the transition isn't
+    a pure linear map over the slot slice.
+    """
+    coeffs: Dict[int, int] = {v: 0 for v in slot_vars}
+    const: int = 0
+    slot_set = set(slot_vars)
+    for mono, c in poly.terms.items():
+        if isinstance(c, Fraction):
+            if c.denominator != 1:
+                return None
+            c = int(c.numerator)
+        if not mono:
+            const = int(c)
+            continue
+        if len(mono) != 1:
+            return None
+        v, p = mono[0]
+        if v not in slot_set or p != 1:
+            return None
+        coeffs[v] = int(c)
+    return coeffs, const
+
+
+def _find_counter_slot(transition: Tuple["RationalStackValue", ...],
+                       slot_vars: List[int]
+                       ) -> Optional[int]:
+    """Return index ``i`` such that ``transition[i] == slot_vars[i] - 1``
+    (the counter slot), or ``None`` if no such slot exists.
+
+    A loop's counter decrements by 1 per iteration and tests against
+    zero at the exit. Identifying it lets the classifier separate the
+    pure-linear "dependent" slots from the counter-driven dynamics.
+    """
+    for i, v in enumerate(slot_vars):
+        t = transition[i]
+        if not isinstance(t, Poly):
+            continue
+        expected = Poly.variable(v) - Poly.constant(1)
+        if t == expected:
+            return i
+    return None
+
+
+def _classify_recurrence(
+    initial_slots: Tuple["RationalStackValue", ...],
+    transition: Tuple["RationalStackValue", ...],
+    body_bindings: Dict[int, int],
+    prefix_bindings: Optional[Dict[int, int]] = None,
+) -> Optional[Tuple[str, "RationalStackValue"]]:
+    """Classify the loop transition and build the closed form.
+
+    Returns ``(tier, closed_form_top)`` where ``tier`` is one of
+    ``"tier1" | "tier2" | "tier3"`` and ``closed_form_top`` is a
+    :class:`Poly` (Tier 1) / :class:`ClosedForm` (Tier 2) /
+    :class:`ProductForm` (Tier 3) representing the projected slot
+    after the loop terminates. Returns ``None`` if none of the tiers
+    match.
+
+    The projected slot is the conventional "output" of the loop — for
+    the catalog's four target programs it's either the accumulator
+    (sum / factorial / power_of_2) or the second Fibonacci term. We
+    pick it as the non-counter slot with the most-complex initial
+    state, falling back to the last non-counter slot.
+    """
+    m = len(transition)
+    if m == 0 or m != len(initial_slots):
+        return None
+    slot_vars = [_SLOT_VAR_BASE + i for i in range(m)]
+
+    # Substitute body-local PUSH bindings so each transition poly is a
+    # "clean" expression over slot_vars only.
+    substituted: List[Poly] = []
+    for t in transition:
+        if not isinstance(t, Poly):
+            return None
+        substituted.append(_substitute_poly(t, body_bindings))
+
+    # Every initial slot is expected to be a Poly over the input PUSH
+    # variables (not the slot vars — those are fresh to the body run).
+    for s in initial_slots:
+        if not isinstance(s, Poly):
+            return None
+        for v in s.variables():
+            if v >= _SLOT_VAR_BASE:
+                return None  # slot vars must not appear in init
+
+    counter_idx = _find_counter_slot(tuple(substituted), slot_vars)
+    if counter_idx is None:
+        return None
+    counter_slot_var = slot_vars[counter_idx]
+    trip_count: Poly = initial_slots[counter_idx]  # type: ignore[assignment]
+
+    # Identify dependent slots (everything except the counter).
+    dep_indices = [i for i in range(m) if i != counter_idx]
+
+    # ── Tier 2 — linear recurrence with constant integer matrix ──
+    # Tried first because any purely-linear recurrence (including
+    # degenerate single-slot ``value <- k·value``) is cleaner as a
+    # :class:`ClosedForm` than as a :class:`ProductForm` of a constant
+    # factor. For each dependent slot, the transition must be affine in
+    # the dependent slots only (no counter dependence, no higher-degree
+    # terms). Build A (|dep| × |dep|) and b (|dep|).
+    dep_slot_vars = [slot_vars[i] for i in dep_indices]
+    A_rows: List[List[int]] = []
+    b_vec: List[int] = []
+    linear_ok = True
+    for i in dep_indices:
+        lin = _extract_linear(substituted[i], dep_slot_vars)
+        if lin is None:
+            linear_ok = False
+            break
+        coeffs, const = lin
+        row = [coeffs[v] for v in dep_slot_vars]
+        A_rows.append(row)
+        b_vec.append(const)
+    if linear_ok:
+        # Sanity-check the counter variable never appears in
+        # dependent-slot transitions — if it does, this isn't a
+        # constant-coefficient linear recurrence and Tier 2 bails.
+        for i in dep_indices:
+            for mono in substituted[i].terms:
+                for v, p in mono:
+                    if v == counter_slot_var:
+                        linear_ok = False
+                        break
+                if not linear_ok:
+                    break
+            if not linear_ok:
+                break
+    if linear_ok and dep_indices:
+        s0_deps: Tuple[Poly, ...] = tuple(
+            initial_slots[i] for i in dep_indices  # type: ignore[misc]
+        )
+        # Projection: pick the last dependent slot by default — for
+        # fibonacci this is ``b`` (= fib(n)); for power_of_2 it's
+        # ``value``; for any single-dependent-slot loop it's the sole
+        # dependent slot.
+        projection = len(dep_indices) - 1
+        cf = ClosedForm(
+            A=tuple(tuple(row) for row in A_rows),
+            b=tuple(b_vec),
+            s_0=s0_deps,
+            trip_count=trip_count,
+            projection=projection,
+        )
+        return "tier2", cf
+
+    # ── Tier 3 — multiplicative single-accumulator pattern ──
+    # Exactly one dependent slot whose transition is
+    # ``slot_acc * p(counter_slot_var)`` for a Poly ``p`` that
+    # *genuinely* depends on the counter (else Tier 2 would already
+    # have caught it). Factorial's body is the canonical example:
+    # ``acc <- acc · counter``.
+    if len(dep_indices) == 1:
+        acc_idx = dep_indices[0]
+        acc_var = slot_vars[acc_idx]
+        acc_trans = substituted[acc_idx]
+        factor_terms: Dict[Monomial, Union[int, Fraction]] = {}
+        ok = True
+        factor_has_counter = False
+        for mono, c in acc_trans.terms.items():
+            acc_power = 0
+            remainder: List[Tuple[int, int]] = []
+            for v, p in mono:
+                if v == acc_var:
+                    acc_power = p
+                elif v == counter_slot_var:
+                    remainder.append((v, p))
+                    factor_has_counter = True
+                else:
+                    ok = False
+                    break
+            if not ok:
+                break
+            if acc_power != 1:
+                ok = False
+                break
+            factor_terms[tuple(remainder)] = c
+        if ok and factor_terms and factor_has_counter:
+            factor = Poly(factor_terms)
+            acc_init = initial_slots[acc_idx]
+            if isinstance(acc_init, Poly):
+                init_int = _as_concrete_int(acc_init)
+                if init_int is None and prefix_bindings is not None:
+                    try:
+                        v = acc_init.eval_at(prefix_bindings)
+                        if isinstance(v, Fraction) and v.denominator != 1:
+                            init_int = None
+                        else:
+                            init_int = int(v)
+                    except KeyError:
+                        init_int = None
+                if init_int is not None:
+                    # Commutative product: iterating counter=upper..1
+                    # matches 1..upper. ``eval_at`` walks lower..upper.
+                    pf = ProductForm(
+                        p=factor,
+                        counter_var=counter_slot_var,
+                        lower=Poly.constant(1),
+                        upper=trip_count,
+                        init=int(init_int),
+                    )
+                    return "tier3", pf
+
+    # ── Tier 1 — affine in dep slots + polynomial driver in counter ──
+    # Single dependent slot whose transition is
+    # ``dep + p(counter_slot_var)`` where ``p`` is any Poly purely in
+    # the counter slot var. Closed form:
+    #   dep_N = dep_0 + Σ_{k=0}^{N-1} p(counter_0 - k)
+    # For the catalog's ``sum_1_to_n_sym`` this is
+    #   acc_N = 0 + Σ_{k=0}^{N-1} (n - k) = n(n+1)/2.
+    if len(dep_indices) == 1:
+        acc_idx = dep_indices[0]
+        acc_var = slot_vars[acc_idx]
+        acc_trans = substituted[acc_idx]
+        # Split into ``acc_var`` contribution and a pure-counter Poly.
+        acc_coef_present = False
+        driver_terms: Dict[Monomial, Union[int, Fraction]] = {}
+        ok = True
+        for mono, c in acc_trans.terms.items():
+            acc_power = 0
+            counter_only: List[Tuple[int, int]] = []
+            other = False
+            for v, p in mono:
+                if v == acc_var:
+                    acc_power = p
+                elif v == counter_slot_var:
+                    counter_only.append((v, p))
+                else:
+                    other = True
+                    break
+            if other:
+                ok = False
+                break
+            if acc_power > 1:
+                ok = False
+                break
+            if acc_power == 1 and counter_only:
+                # acc_var * counter^k — Tier 3 territory, not Tier 1.
+                ok = False
+                break
+            if acc_power == 1:
+                if c != 1:
+                    ok = False
+                    break
+                acc_coef_present = True
+                continue
+            driver_terms[tuple(counter_only)] = c
+        if ok and acc_coef_present:
+            driver = Poly(driver_terms)
+            # Symbolic summation: let k ∈ {0, .., N-1} and counter_k =
+            # counter_0 - k. Σ_{k=0}^{N-1} p(counter_0 - k). Change
+            # variable j = counter_0 - k → as k runs 0..N-1, j runs
+            # counter_0..counter_0-N+1 = counter_0..1 (decreasing).
+            # For N = counter_0 this is Σ_{j=1}^{counter_0} p(j).
+            # Build that sum symbolically by unrolling under Faulhaber
+            # — but trip_count is itself symbolic, so we need closed
+            # Faulhaber polynomials for each power.
+            # Driver is Poly over a single variable counter_slot_var.
+            acc_init = initial_slots[acc_idx]
+            if not isinstance(acc_init, Poly):
+                return None
+            closed = _faulhaber_sum(driver, counter_slot_var, trip_count)
+            if closed is None:
+                return None
+            return "tier1", acc_init + closed
+
+    return None
+
+
+# Faulhaber polynomials up to degree 3. Each entry is a list of Fraction
+# coefficients [c_0, c_1, ..., c_{d+1}] so that
+#   S_d(n) = Σ_{k=1}^{n} k^d = c_0 + c_1·n + c_2·n² + ... + c_{d+1}·n^{d+1}.
+# Only the degrees actually exercised by the catalog are encoded; higher
+# degrees raise and bail out of inference.
+_FAULHABER: Dict[int, List[Fraction]] = {
+    0: [Fraction(0), Fraction(1)],                                 # n
+    1: [Fraction(0), Fraction(1, 2), Fraction(1, 2)],              # n(n+1)/2
+    2: [Fraction(0), Fraction(1, 6), Fraction(1, 2), Fraction(1, 3)],
+    3: [Fraction(0), Fraction(0), Fraction(1, 4), Fraction(1, 2), Fraction(1, 4)],
+}
+
+
+def _sum_k_power(degree: int, upper: Poly) -> Optional[Poly]:
+    """Return ``Σ_{k=1}^{upper} k^degree`` as a Poly in ``upper``.
+
+    ``upper`` is a Poly (typically a single variable ``x_n``). Uses the
+    Faulhaber coefficients above; returns ``None`` for degrees beyond
+    the encoded table.
+    """
+    if degree < 0:
+        return None
+    coefs = _FAULHABER.get(degree)
+    if coefs is None:
+        return None
+    # Build Σ = Σ_j coefs[j] * upper^j.
+    total = Poly.constant(0)
+    power = Poly.constant(1)
+    for j, c in enumerate(coefs):
+        if c != 0:
+            total = total + Poly({(): c}) * power
+        if j < len(coefs) - 1:
+            power = power * upper
+    return total
+
+
+def _faulhaber_sum(driver: Poly, counter_var: int,
+                   trip_count: Poly) -> Optional[Poly]:
+    """Evaluate ``Σ_{j=1}^{trip_count} driver(j)`` symbolically.
+
+    ``driver`` is a Poly in ``counter_var`` only. The identity
+    ``Σ_{j=1}^{N} j^d`` is realised by :func:`_sum_k_power` for each
+    monomial; the sum is linear in the driver's coefficients.
+    """
+    total = Poly.constant(0)
+    for mono, coeff in driver.terms.items():
+        if not mono:
+            # Constant term c contributes c·trip_count.
+            total = total + Poly({(): coeff}) * trip_count
+            continue
+        if len(mono) != 1:
+            return None
+        v, p = mono[0]
+        if v != counter_var:
+            return None
+        s_poly = _sum_k_power(p, trip_count)
+        if s_poly is None:
+            return None
+        total = total + Poly({(): coeff}) * s_poly
+    return total
+
+
+def _try_solve_recurrence(
+    prog: List[isa.Instruction],
+    stuck_path: "_Path",
+    input_mode: str,
+    ops: ArithmeticOps,
+) -> Optional["RationalStackValue"]:
+    """Top-level driver: try to emit a closed form for the loop that
+    halted ``stuck_path`` with ``loop_symbolic``.
+
+    Returns the projected closed-form top (:class:`Poly` /
+    :class:`ClosedForm` / :class:`ProductForm`) or ``None`` if any
+    step of the inference bails. Structured as a best-effort pass:
+    any failure falls cleanly through to the existing
+    ``loop_symbolic`` behaviour.
+    """
+    back_edge_pc = stuck_path.pc
+    if back_edge_pc < 0 or back_edge_pc >= len(prog):
+        return None
+    back_edge = prog[back_edge_pc]
+    if back_edge.op not in (isa.OP_JZ, isa.OP_JNZ):
+        return None
+    loop_header_pc = int(back_edge.arg)
+    if loop_header_pc < 0 or loop_header_pc > back_edge_pc:
+        return None
+
+    # 1. Prefix → initial loop state.
+    prefix = _run_prefix(prog, loop_header_pc, input_mode, ops)
+    if prefix is None:
+        return None
+    initial_stack, prefix_bindings = prefix
+    n_slots = len(initial_stack)
+    if n_slots == 0:
+        return None
+
+    # 2. Body → transition on slot vars.
+    body_out = _run_body_iteration(
+        prog, loop_header_pc, back_edge_pc, n_slots, input_mode, ops,
+    )
+    if body_out is None:
+        return None
+    transition, body_bindings = body_out
+
+    # 3. Classify.
+    classified = _classify_recurrence(
+        tuple(initial_stack), transition, body_bindings,
+        prefix_bindings=prefix_bindings,
+    )
+    if classified is None:
+        return None
+    _tier, closed_top = classified
+    return closed_top
 
 
 # ─── Reporting helper ─────────────────────────────────────────────
