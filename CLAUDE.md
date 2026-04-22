@@ -174,32 +174,25 @@ Phase 13 proves the compiled transformer is a general-purpose stack computer, no
 
 ### File Reading Discipline
 
-**Start with `_MAP.md`.** Always read `_MAP.md` before reading source files. It shows every class, function, and method with signatures and line numbers. Use it to plan targeted reads instead of guessing at file contents.
+**Use tree-sitting to navigate, then Read scoped line ranges.** Several files in this repo exceed the Read tool's token cap (executor.py, symbolic_executor.py, ff_symbolic.py, symbolic_programs_catalog.py). Don't try to read them whole — it fails. Use the `tree-sitting` skill to find the exact symbol and line range, then Read only that window.
 
-**The Read tool has a 10,000 token limit per call.** Several files in this repo exceed that (executor.py is ~11,500 tokens). Do NOT attempt to read large files in full — it will fail. Instead:
+```bash
+TREESIT=/mnt/skills/user/tree-sitting/scripts/treesit.py
+PY=/home/claude/.venv/bin/python
 
-1. Read `_MAP.md` (always fits, shows the whole repo structure)
-2. Identify the specific classes/functions you need by line number
-3. Read only those line ranges: e.g., `executor.py` lines 43-312 for `NumPyExecutor`, lines 313-568 for `CompiledModel`
-
-**Pattern — map-then-target:**
-```
-Read _MAP.md → identify NumPyExecutor.execute at :49 → Read executor.py lines 43-312
-```
-
-**Anti-pattern — blind chunking:**
-```
-Read executor.py (fails: 11562 tokens) → Read executor.py offset=0 limit=5000 → Read executor.py offset=5000 limit=5000 → lose track of what's where
+$PY $TREESIT .                              # repo overview
+$PY $TREESIT . 'find:NumPyExecutor'          # locate a symbol
+$PY $TREESIT . 'source:NumPyExecutor.execute' # print source + line range
+$PY $TREESIT . 'refs:CompiledModel'          # find references before editing
 ```
 
-**Anti-pattern — line-by-line reads:**
-```
-Read executor.py lines 1-100 → think → Read lines 100-200 → think → (repeat 6 more times)
-```
+**Pattern — find-then-target:** `find:Symbol` → Read file with the returned `offset`/`limit`.
 
-The map tells you exactly where everything is. Use it. One map read + one targeted read beats five exploratory reads.
+**Anti-pattern — blind chunking:** Read executor.py (fails) → Read offset=0 limit=5000 → Read offset=5000 limit=5000 → lose track of what's where.
 
-For files under 10K tokens (most phase files, programs.py, isa.py, test_consolidated.py), reading the full file in one shot is fine and preferred.
+**Anti-pattern — line-by-line reads:** Read lines 1-100 → think → Read 100-200 → think → repeat.
+
+For files under the Read cap (phase files, programs.py, isa.py, test_consolidated.py), a full read is fine and preferred.
 
 ### Environment Setup
 
