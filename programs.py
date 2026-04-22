@@ -679,3 +679,37 @@ def make_is_power_of_2(n):
         Instruction(OP_HALT),
     ]
     return prog, expected
+
+
+# ─── Issue #89 — Symbolic-counter generators for the closed-form path ────
+#
+# The forking executor's recurrence solver (symbolic_executor._try_solve_recurrence)
+# closes loops whose body is an affine / linear / multiplicative recurrence on
+# the loop-carried stack slice. The bytecode for the symbolic-counter programs
+# is identical to their concrete-counter counterparts — the "symbolic"
+# adjective refers to how the classifier treats the PUSH-allocated variables,
+# not to any structural change in the program. These aliases exist so the
+# catalog can label the closed-form rows distinctly from the unrolled ones.
+
+def make_sum_1_to_n_sym(n):
+    """Same bytecode as :func:`make_sum_1_to_n`; classifies as
+    ``collapsed_closed_form`` (Tier 1, Poly top) via the #89 solver."""
+    return make_sum_1_to_n(n)
+
+
+def make_power_of_2_sym(n):
+    """Same bytecode as :func:`make_power_of_2`; classifies as
+    ``collapsed_closed_form`` (Tier 2, ClosedForm top) via the #89 solver."""
+    return make_power_of_2(n)
+
+
+def make_fibonacci_sym(n):
+    """Same bytecode as :func:`make_fibonacci`; classifies as
+    ``collapsed_closed_form`` (Tier 2, ClosedForm top) via the #89 solver."""
+    return make_fibonacci(n)
+
+
+def make_factorial_sym(n):
+    """Same bytecode as :func:`make_factorial`; classifies as
+    ``collapsed_closed_form`` (Tier 3, ProductForm top) via the #89 solver."""
+    return make_factorial(n)

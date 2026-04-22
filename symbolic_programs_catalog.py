@@ -37,11 +37,13 @@ from executor import NumPyExecutor
 from isa import program
 from symbolic_executor import (
     BitVec,
+    ClosedForm,
     ForkingResult,
     Guard,
     GuardedPoly,
     IndicatorPoly,
     Poly,
+    ProductForm,
     RationalPoly,
     SymbolicOpNotSupported,
     SymbolicRemainder,
@@ -124,13 +126,14 @@ _FORKING_OPS = _POLY_OPS | _BRANCH_OPS
 
 
 # Status codes emitted by classify_program.
-STATUS_COLLAPSED          = "collapsed"
-STATUS_COLLAPSED_GUARDED  = "collapsed_guarded"
-STATUS_COLLAPSED_UNROLLED = "collapsed_unrolled"
-STATUS_BLOCKED_OPCODE     = "blocked_opcode"
-STATUS_BLOCKED_UNDERFLOW  = "blocked_underflow"
-STATUS_BLOCKED_LOOP_SYM   = "blocked_loop_symbolic"
-STATUS_BLOCKED_PATH_EXP   = "blocked_path_explosion"
+STATUS_COLLAPSED              = "collapsed"
+STATUS_COLLAPSED_GUARDED      = "collapsed_guarded"
+STATUS_COLLAPSED_UNROLLED     = "collapsed_unrolled"
+STATUS_COLLAPSED_CLOSED_FORM  = "collapsed_closed_form"
+STATUS_BLOCKED_OPCODE         = "blocked_opcode"
+STATUS_BLOCKED_UNDERFLOW      = "blocked_underflow"
+STATUS_BLOCKED_LOOP_SYM       = "blocked_loop_symbolic"
+STATUS_BLOCKED_PATH_EXP       = "blocked_path_explosion"
 
 
 @dataclass
@@ -150,6 +153,12 @@ class ClassificationResult:
     # bit-vector op (AND/OR/XOR/SHL/SHR_S/SHR_U/CLZ/CTZ/POPCNT) or a
     # hybrid arithmetic op lifted into the BitVec AST.
     bitvec: Optional[BitVec] = None
+    # Closed-form tops (issue #89) — present when the program ends in a
+    # loop that the recurrence solver closed. Tier 1 (affine) returns a
+    # Poly via the ``poly`` field with ``closed_form`` left as None.
+    # Tier 2 (linear constant-matrix) populates ``closed_form`` with a
+    # ClosedForm; Tier 3 (multiplicative) with a ProductForm.
+    closed_form: Optional[Any] = None     # Union[ClosedForm, ProductForm]
     n_heads: int = 0
     bindings: Dict[int, int] = field(default_factory=dict)
     n_cases: int = 0                       # number of cases in guarded output
@@ -160,14 +169,25 @@ def _poly_or_guarded(result: ForkingResult):
     return result.top
 
 
-def classify_program(prog) -> ClassificationResult:
+def classify_program(prog, *, solve_recurrences: bool = False) -> ClassificationResult:
     """Pre-flight check + forking symbolic execute. First blocker wins.
+
+    ``solve_recurrences`` (issue #89): when ``True``, loops that hit a
+    symbolic back-edge are routed through the recurrence solver and
+    classified as ``collapsed_closed_form`` on success — with the
+    appropriate sibling (:class:`Poly` for Tier 1, :class:`ClosedForm`
+    for Tier 2, :class:`ProductForm` for Tier 3) populated on the
+    result. Default ``False`` preserves the pre-#89 behaviour so
+    existing concrete-counter rows (``fibonacci(5)`` etc.) continue to
+    classify as ``collapsed_unrolled`` via the concrete-mode fallback.
 
     Order of checks:
       1. ``blocked_opcode`` — any op outside ``_FORKING_OPS``.
       2. Run :func:`run_forking` in symbolic mode:
          - straight → ``collapsed`` (same semantics as the old executor).
          - guarded → ``collapsed_guarded`` with a GuardedPoly top.
+         - closed_form (issue #89, ``solve_recurrences=True``) →
+           ``collapsed_closed_form``.
          - unrolled (bounded loop with concrete counter) → ``collapsed_unrolled``.
          - loop_symbolic → retry in concrete mode; if that completes with
            straight/unrolled, return ``collapsed_unrolled``; else
@@ -184,7 +204,8 @@ def classify_program(prog) -> ClassificationResult:
             )
 
     try:
-        r_sym = run_forking(prog, input_mode="symbolic")
+        r_sym = run_forking(prog, input_mode="symbolic",
+                            solve_recurrences=solve_recurrences)
     except SymbolicOpNotSupported as sym_err:
         # Symbolic mode might fail on paths that concrete mode handles
         # (e.g. a bit-op loop where JZ on a BitVec cond is symbolic-only
@@ -265,6 +286,23 @@ def classify_program(prog) -> ClassificationResult:
                 status=STATUS_COLLAPSED_UNROLLED, poly=top,
                 n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
             )
+    if r_sym.status == "closed_form":
+        # Issue #89: the recurrence solver closed the loop. Tier 1
+        # stays in Poly (``poly`` field); Tier 2 / Tier 3 populate
+        # ``closed_form`` with a ClosedForm / ProductForm respectively.
+        if isinstance(r_sym.top, Poly):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_CLOSED_FORM,
+                poly=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
+        if isinstance(r_sym.top, (ClosedForm, ProductForm)):
+            return ClassificationResult(
+                status=STATUS_COLLAPSED_CLOSED_FORM,
+                closed_form=r_sym.top,
+                n_heads=r_sym.n_heads, bindings=dict(r_sym.bindings),
+            )
+        # Unexpected top type — fall through to concrete retry.
 
     # loop_symbolic or mixed: retry in concrete mode. Concrete mode
     # specialises every PUSH to its literal value, so loops whose
@@ -297,6 +335,12 @@ class CatalogEntry:
     name: str
     prog: Any
     expected: Any  # programs.py returns an int; None for trap cases
+    # Issue #89: when True, ``classify_program`` runs with recurrence
+    # solving enabled and loops close via the Tier 1/2/3 path instead
+    # of falling back to concrete-mode unrolling. Default False keeps
+    # existing rows (``fibonacci(5)`` etc.) in their pre-#89
+    # ``collapsed_unrolled`` classification.
+    solve_recurrences: bool = False
 
 
 def _default_catalog() -> List[CatalogEntry]:
@@ -402,6 +446,29 @@ def _default_catalog() -> List[CatalogEntry]:
     # Bit-vector loop (issue #77) — concrete-mode unroll with bit ops.
     entries.append(CatalogEntry("popcount_loop(5)", *P.make_popcount_loop(5)))
 
+    # Closed-form loops (issue #89) — symbolic-counter rows that
+    # classify as ``collapsed_closed_form`` via the recurrence solver.
+    # Parallel to the concrete-counter rows above; same bytecode but
+    # tagged ``solve_recurrences=True`` so the forking executor keeps
+    # ``n`` symbolic and emits a Poly / ClosedForm / ProductForm top
+    # instead of falling back to concrete-mode unrolling.
+    entries.append(CatalogEntry(
+        "sum_1_to_n_sym(n)", *P.make_sum_1_to_n_sym(5),
+        solve_recurrences=True,
+    ))
+    entries.append(CatalogEntry(
+        "power_of_2_sym(n)", *P.make_power_of_2_sym(4),
+        solve_recurrences=True,
+    ))
+    entries.append(CatalogEntry(
+        "fibonacci_sym(n)", *P.make_fibonacci_sym(5),
+        solve_recurrences=True,
+    ))
+    entries.append(CatalogEntry(
+        "factorial_sym(n)", *P.make_factorial_sym(4),
+        solve_recurrences=True,
+    ))
+
     # Pure finite conditionals — collapse to guarded polys (issue #70).
     entries.append(CatalogEntry("select_by_sign(7)", *P.make_select_by_sign(7)))
     entries.append(CatalogEntry("clamp_zero(5)",     *P.make_clamp_zero(5)))
@@ -470,6 +537,14 @@ class CatalogRow:
     # ``M_BITBIN`` / ``M_BITUN``. ``n_monomials`` reports the AST's
     # node count as a complexity proxy.
     is_bitvec: bool = False
+    # Closed-form top flag (issue #89) — True for programs whose loop
+    # closed via the Tier 2 :class:`ClosedForm` or Tier 3
+    # :class:`ProductForm` path. Tier 1 rows (Poly top) use the
+    # regular polynomial filler and leave this flag False. eml_*
+    # columns stay ``None`` since matrix exponentiation / bounded
+    # products aren't expressible in the single-operator EML family;
+    # the closed form evaluates numerically at binding time instead.
+    is_closed_form: bool = False
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -533,7 +608,8 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
     rows: List[CatalogRow] = []
     for entry in entries:
         row = CatalogRow(name=entry.name, status="")
-        cr = classify_program(entry.prog)
+        cr = classify_program(entry.prog,
+                              solve_recurrences=entry.solve_recurrences)
         row.status = cr.status
         row.blocker = cr.blocker
         row.n_heads = cr.n_heads
@@ -554,6 +630,17 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         elif cr.status == STATUS_COLLAPSED_GUARDED:
             assert cr.guarded is not None
             _fill_guarded_row(row, cr.guarded, cr.bindings, row.numpy_top)
+        elif cr.status == STATUS_COLLAPSED_CLOSED_FORM:
+            # Issue #89. Tier 1 lands as a Poly via ``cr.poly``;
+            # Tier 2 / Tier 3 populate ``cr.closed_form``. Both paths
+            # flip ``is_closed_form`` so the report column is
+            # consistent, even though Tier 1's top IS a plain Poly.
+            if cr.poly is not None:
+                _fill_poly_row(row, cr.poly, cr.bindings, row.numpy_top)
+                row.is_closed_form = True
+            elif cr.closed_form is not None:
+                _fill_closed_form_row(row, cr.closed_form, cr.bindings,
+                                      row.numpy_top)
         # Otherwise: row stays minimally populated (blocker-only).
 
         rows.append(row)
@@ -690,6 +777,45 @@ def _fill_bitvec_row(row: CatalogRow, bitvec: BitVec,
         row.numeric_match = (sym_val == numpy_top)
 
 
+def _fill_closed_form_row(row: CatalogRow, closed_form,
+                          bindings: Dict[int, int],
+                          numpy_top: Optional[int]) -> None:
+    """Populate a CatalogRow from a Tier 2 :class:`ClosedForm` or Tier 3
+    :class:`ProductForm` top (issue #89).
+
+    Renders via ``repr`` and evaluates via ``closed_form.eval_at`` so
+    the matrix exponentiation (Tier 2) or bounded product (Tier 3)
+    fires only at the binding boundary — same contract as
+    :class:`RationalPoly` / :class:`IndicatorPoly` / :class:`BitVec`
+    since neither is a polynomial in the input variables. eml-sr
+    columns stay ``None`` — the single-operator EML family has no
+    matrix-power or bounded-product primitive; the non-polynomial
+    step lives at the FF-dispatch boundary, not inside the algebra.
+
+    ``n_monomials`` is repurposed as a structural-size proxy: the
+    matrix dimension ``m`` for ClosedForm or the number of distinct
+    counter powers in ``p`` for ProductForm.
+    """
+    row.is_closed_form = True
+    row.poly_expr = repr(closed_form)
+    if isinstance(closed_form, ClosedForm):
+        row.n_monomials = len(closed_form.A)
+    elif isinstance(closed_form, ProductForm):
+        row.n_monomials = closed_form.p.n_monomials()
+    else:
+        row.n_monomials = None
+
+    try:
+        sym_val = closed_form.eval_at(bindings) if bindings else None
+    except (KeyError, ValueError, ZeroDivisionError):
+        sym_val = None
+
+    if sym_val is None or numpy_top is None:
+        row.numeric_match = None
+    else:
+        row.numeric_match = (int(sym_val) == int(numpy_top))
+
+
 def _fill_guarded_row(row: CatalogRow, guarded: GuardedPoly,
                       bindings: Dict[int, int],
                       numpy_top: Optional[int]) -> None:
@@ -803,14 +929,17 @@ def format_report(rows: List[CatalogRow]) -> str:
     n_collapsed = sum(1 for r in rows if r.status == STATUS_COLLAPSED)
     n_guarded = sum(1 for r in rows if r.status == STATUS_COLLAPSED_GUARDED)
     n_unrolled = sum(1 for r in rows if r.status == STATUS_COLLAPSED_UNROLLED)
+    n_closed = sum(1 for r in rows if r.status == STATUS_COLLAPSED_CLOSED_FORM)
     n_loop_sym = sum(1 for r in rows if r.status == STATUS_BLOCKED_LOOP_SYM)
     n_opcode = sum(1 for r in rows if r.status == STATUS_BLOCKED_OPCODE)
-    n_other = len(rows) - n_collapsed - n_guarded - n_unrolled - n_loop_sym - n_opcode
+    n_other = (len(rows) - n_collapsed - n_guarded - n_unrolled - n_closed
+               - n_loop_sym - n_opcode)
 
     summary_parts = [
         f"{n_collapsed} collapsed",
         f"{n_guarded} guarded",
         f"{n_unrolled} unrolled",
+        f"{n_closed} closed-form",
         f"{n_loop_sym} loop-symbolic",
         f"{n_opcode} blocked-by-opcode",
     ]
@@ -898,6 +1027,32 @@ def format_report(rows: List[CatalogRow]) -> str:
 
     lines += [
         "",
+        "## Collapsed (closed form from symbolic loop — issue #89)",
+        "",
+        "Rows whose loop body is an affine / linear / multiplicative",
+        "recurrence on the loop-carried stack slice. The recurrence",
+        "solver emits a `Poly` (Tier 1, via Faulhaber), `ClosedForm`",
+        "(Tier 2, constant integer matrix), or `ProductForm` (Tier 3,",
+        "bounded product of a Poly factor). Unlike the _unrolled_ rows",
+        "above, this is a **symbolic proof** that holds at every `n`,",
+        "not a single-input execution trace. eml-sr columns stay `–`",
+        "— matrix power and bounded products aren't expressible in the",
+        "single-operator EML family.",
+        "",
+        "| Program | k heads | size | closed form | match |",
+        "|---|---:|---:|---|:-:|",
+    ]
+    for r in rows:
+        if r.status != STATUS_COLLAPSED_CLOSED_FORM:
+            continue
+        size = r.n_monomials if r.n_monomials is not None else "–"
+        lines.append(
+            f"| `{r.name}` | {r.n_heads} | {size} | "
+            f"`{r.poly_expr}` | {_fmt_match(r.numeric_match)} |"
+        )
+
+    lines += [
+        "",
         "## Blocked (out of symbolic-executor scope)",
         "",
         "| Program | reason | blocker |",
@@ -905,7 +1060,8 @@ def format_report(rows: List[CatalogRow]) -> str:
     ]
     for r in rows:
         if r.status in (STATUS_COLLAPSED, STATUS_COLLAPSED_GUARDED,
-                         STATUS_COLLAPSED_UNROLLED) or r.status == "":
+                         STATUS_COLLAPSED_UNROLLED,
+                         STATUS_COLLAPSED_CLOSED_FORM) or r.status == "":
             continue
         reason = _BLOCK_REASON.get(r.status, r.status)
         blocker = r.blocker if r.blocker else "–"
@@ -935,6 +1091,7 @@ __all__ = [
     "STATUS_COLLAPSED",
     "STATUS_COLLAPSED_GUARDED",
     "STATUS_COLLAPSED_UNROLLED",
+    "STATUS_COLLAPSED_CLOSED_FORM",
     "STATUS_BLOCKED_OPCODE",
     "STATUS_BLOCKED_UNDERFLOW",
     "STATUS_BLOCKED_LOOP_SYM",
