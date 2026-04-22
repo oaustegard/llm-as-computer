@@ -36,6 +36,7 @@ from symbolic_executor import (
     SymbolicOpNotSupported,
     SymbolicStackUnderflow,
     collapse_report,
+    guarded_to_mermaid,
     run_forking,
     run_symbolic,
 )
@@ -593,6 +594,81 @@ def test_collapse_report_format():
     assert "9 heads" in msg
     assert "1 monomial" in msg
     assert "16·x0" in msg
+
+
+# ─── guarded_to_mermaid ───────────────────────────────────────────
+
+def _simple_gp() -> GuardedPoly:
+    """2-case single-guard GuardedPoly: {x0 == 0} → x5 | {x0 != 0} → x0."""
+    x0 = Poly.variable(0)
+    x5 = Poly.variable(5)
+    return GuardedPoly(cases=(
+        ((Guard(x0, REL_EQ),), x5),
+        ((Guard(x0, REL_NE),), x0),
+    ))
+
+
+def test_guarded_to_mermaid_flowchart_header():
+    """Output starts with the required Mermaid flowchart directive."""
+    out = guarded_to_mermaid(_simple_gp())
+    assert out.startswith("flowchart TD"), repr(out[:60])
+
+
+def test_guarded_to_mermaid_covers_every_case_exactly_once():
+    """Each case's value_poly appears as a Mermaid leaf label exactly once."""
+    gp = _simple_gp()
+    out = guarded_to_mermaid(gp)
+    for _guards, value in gp.cases:
+        # Use the full leaf-node syntax ["value"] to avoid false positives
+        # from guard labels that may contain the same substring.
+        leaf_pat = f'["{repr(value)}"]'
+        count = out.count(leaf_pat)
+        assert count == 1, (
+            f"{leaf_pat!r} appears {count} times (expected 1) in:\n{out}"
+        )
+
+
+def test_guarded_to_mermaid_two_case_has_one_decision_node():
+    """A 2-case single-guard GuardedPoly produces exactly 1 decision diamond."""
+    import re
+    out = guarded_to_mermaid(_simple_gp())
+    # Decision nodes look like D1{...} in the output
+    decision_lines = [ln for ln in out.splitlines() if re.search(r'\bD\d+\{', ln)]
+    assert len(decision_lines) == 1, (
+        f"Expected 1 decision node, got {len(decision_lines)}:\n{out}"
+    )
+
+
+def test_guarded_to_mermaid_true_and_false_edges_present():
+    """The output contains both True and False edges for a binary split."""
+    out = guarded_to_mermaid(_simple_gp())
+    assert "|True|" in out, f"Missing True edge:\n{out}"
+    assert "|False|" in out, f"Missing False edge:\n{out}"
+
+
+def test_guarded_to_mermaid_three_case_has_two_decision_nodes():
+    """A 3-case GuardedPoly produces exactly 2 decision nodes."""
+    import re
+    x0 = Poly.variable(0)
+    x1 = Poly.variable(1)
+    x2 = Poly.variable(2)
+    # Construct a 3-case partition: x0<0, x0>0, else (x0==0)
+    gp = GuardedPoly(cases=(
+        ((Guard(x0, REL_LT),), x1),
+        ((Guard(x0, REL_GT),), x2),
+        ((Guard(x0, REL_EQ),), Poly.constant(0)),
+    ))
+    out = guarded_to_mermaid(gp)
+    decision_lines = [ln for ln in out.splitlines() if re.search(r'\bD\d+\{', ln)]
+    assert len(decision_lines) == 2, (
+        f"Expected 2 decision nodes, got {len(decision_lines)}:\n{out}"
+    )
+    # All 3 case values appear exactly once as leaf labels.
+    for _guards, value in gp.cases:
+        leaf_pat = f'["{repr(value)}"]'
+        assert out.count(leaf_pat) == 1, (
+            f"{leaf_pat!r} should appear exactly once as a leaf:\n{out}"
+        )
 
 
 # ─── Runner ───────────────────────────────────────────────────────

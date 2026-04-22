@@ -2064,6 +2064,79 @@ def collapse_report(prog: List[isa.Instruction], *,
             f"monomials, top = {r.top}")
 
 
+def guarded_to_mermaid(gp: "GuardedPoly") -> str:
+    """Render a ``GuardedPoly`` case table as a Mermaid flowchart decision tree.
+
+    Returns valid Mermaid ``flowchart TD`` source. The last case is rendered
+    as an implicit ``else`` leaf — its guards are implied by the preceding
+    decisions — so a 2-case / single-guard GuardedPoly produces exactly one
+    decision diamond and two value leaves.
+
+    Multi-guard cases chain their guards with ``True`` edges; the ``False``
+    edge of each case's last guard connects to the next case.
+    """
+    def _label(g: "Guard") -> str:
+        return f"{g.poly} {_REL_SYMBOL[g.relation]} 0"
+
+    def _mq(s: str) -> str:
+        return '"' + s.replace('"', "'") + '"'
+
+    lines = ["flowchart TD"]
+    ctr = [0]
+
+    def _fresh(prefix: str) -> str:
+        ctr[0] += 1
+        return f"{prefix}{ctr[0]}"
+
+    cases = list(gp.cases)
+    n = len(cases)
+    pending: Optional[Tuple[str, str]] = None  # (from_node_id, edge_label)
+
+    for i, (guards, value) in enumerate(cases):
+        guards_list = list(guards)
+
+        if i == n - 1:
+            # Last case: render as implied else leaf (guards follow by elimination).
+            leaf = _fresh("L")
+            lines.append(f"    {leaf}[{_mq(repr(value))}]")
+            if pending:
+                src, lbl = pending
+                lines.append(f"    {src} -->|{lbl}| {leaf}")
+            break
+
+        if not guards_list:
+            # Unconditional middle case (degenerate; shouldn't appear in a valid partition).
+            leaf = _fresh("L")
+            lines.append(f"    {leaf}[{_mq(repr(value))}]")
+            if pending:
+                src, lbl = pending
+                lines.append(f"    {src} -->|{lbl}| {leaf}")
+            pending = None
+            continue
+
+        # Chain each guard in the conjunction with True edges between them.
+        prev_dec: Optional[str] = None
+        for j, g in enumerate(guards_list):
+            dec = _fresh("D")
+            lines.append(f"    {dec}{{{_mq(_label(g))}}}")
+            if j == 0 and pending:
+                src, lbl = pending
+                lines.append(f"    {src} -->|{lbl}| {dec}")
+            elif j > 0 and prev_dec is not None:
+                lines.append(f"    {prev_dec} -->|True| {dec}")
+            prev_dec = dec
+
+        # True branch of the last guard leads to this case's value leaf.
+        leaf = _fresh("L")
+        lines.append(f"    {leaf}[{_mq(repr(value))}]")
+        lines.append(f"    {prev_dec} -->|True| {leaf}")
+
+        # False branch of the last guard connects to the next case.
+        pending = (prev_dec, "False")
+
+    return "\n".join(lines)
+
+
 __all__ = [
     "Poly",
     "ModPoly",
@@ -2088,4 +2161,5 @@ __all__ = [
     "run_symbolic",
     "run_forking",
     "collapse_report",
+    "guarded_to_mermaid",
 ]

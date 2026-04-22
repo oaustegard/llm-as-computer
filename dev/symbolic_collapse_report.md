@@ -52,6 +52,20 @@ number stay distinguishable. _value Σ size_ / _value max depth_
 sum and max across cases' value trees; _guard Σ size_ / _guard
 max depth_ do the same across every guard tree.
 
+**Visualising partition structure.** The flat `[(guards, value), ...]`
+table can be rendered as a decision-tree diagram via
+`symbolic_executor.guarded_to_mermaid(gp)`. Example for
+`clamp_zero(5)`:
+
+```mermaid
+flowchart TD
+    D1{"x0 != 0"}
+    L2["x0"]
+    D1 -->|True| L2
+    L3["x5"]
+    D1 -->|False| L3
+```
+
 | Program | k heads | # cases | cases | value Σ size | value max depth | guard Σ size | guard max depth | match |
 |---|---:|---:|---|---:|---:|---:|---:|:-:|
 | `select_by_sign(7)` | 5 | 2 | `{x0 != 0} → x4`<br>`{x0 == 0} → x7` | 2 | 0 | 2 | 0 | ✓ |
