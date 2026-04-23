@@ -813,7 +813,7 @@ def compare_traces(trace_a, trace_b):
     return True, "match"
 
 
-def test_algorithm(name, prog, expected, np_exec, pt_exec, verbose=False):
+def _test_algorithm(name, prog, expected, np_exec, pt_exec, verbose=False):
     """Run an algorithm on both executors and verify."""
     np_trace = np_exec.execute(prog)
     pt_trace = pt_exec.execute(prog)
@@ -842,7 +842,7 @@ def test_algorithm(name, prog, expected, np_exec, pt_exec, verbose=False):
     return all_ok, len(np_trace.steps)
 
 
-def test_trap_algorithm(name, prog, np_exec, pt_exec, verbose=False):
+def _test_trap_algorithm(name, prog, np_exec, pt_exec, verbose=False):
     """Run a program expected to TRAP on both executors. Returns True if both trap."""
     np_trace = np_exec.execute(prog)
     pt_trace = pt_exec.execute(prog)

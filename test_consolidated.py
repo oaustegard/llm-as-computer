@@ -11,7 +11,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from isa import (
-    Instruction, compare_traces, test_algorithm, test_trap_algorithm,
+    Instruction, compare_traces, _test_algorithm, _test_trap_algorithm,
     OP_PUSH, OP_POP, OP_ADD, OP_DUP, OP_HALT,
     OP_SUB, OP_JZ, OP_JNZ, OP_NOP,
     OP_SWAP, OP_OVER, OP_ROT,
