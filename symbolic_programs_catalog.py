@@ -604,6 +604,20 @@ class CatalogRow:
     # products aren't expressible in the single-operator EML family;
     # the closed form evaluates numerically at binding time instead.
     is_closed_form: bool = False
+    # FF-equivalence claim strength (issue #90). Three values:
+    #   ``"bilinear"`` — the FF layer's weight matrices (M_ADD / M_SUB /
+    #     B_MUL / M_DIV_S / M_REM_S / M_CMP / M_EQZ / M_BITBIN / M_BITUN)
+    #     compose to realise the symbolic top structurally. Covers every
+    #     collapsed / guarded / unrolled row plus Tier 1
+    #     ``collapsed_closed_form`` (Poly emitted by Faulhaber).
+    #   ``"solver_structural"`` — the recurrence solver emits a sibling
+    #     value-equal across drivers, but forward-time ``eval_at``
+    #     (matrix power / bounded product) is the non-polynomial boundary
+    #     step and has no weight-layer realisation. Tier 2 / Tier 3
+    #     ``collapsed_closed_form`` rows only.
+    #   ``"n/a"`` — row didn't collapse; no FF-equivalence claim to make.
+    # See ``dev/ff_closed_form_equivalence.md``.
+    ff_equiv: Optional[str] = None
 
 
 def _numpy_top(np_exec: NumPyExecutor, prog) -> Optional[int]:
@@ -701,6 +715,19 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
                 _fill_closed_form_row(row, cr.closed_form, cr.bindings,
                                       row.numpy_top)
         # Otherwise: row stays minimally populated (blocker-only).
+
+        # FF-equivalence tag (issue #90). See the CatalogRow field docs
+        # + dev/ff_closed_form_equivalence.md for the full taxonomy.
+        if row.status in (STATUS_COLLAPSED, STATUS_COLLAPSED_GUARDED,
+                          STATUS_COLLAPSED_UNROLLED):
+            row.ff_equiv = "bilinear"
+        elif row.status == STATUS_COLLAPSED_CLOSED_FORM:
+            # Tier 2 / Tier 3 siblings live in ``cr.closed_form``;
+            # Tier 1 (Poly) rides the existing bilinear-form theorem.
+            row.ff_equiv = ("solver_structural"
+                            if cr.closed_form is not None else "bilinear")
+        else:
+            row.ff_equiv = "n/a"
 
         rows.append(row)
     return rows
@@ -1098,8 +1125,17 @@ def format_report(rows: List[CatalogRow]) -> str:
         "— matrix power and bounded products aren't expressible in the",
         "single-operator EML family.",
         "",
-        "| Program | k heads | size | closed form | match |",
-        "|---|---:|---:|---|:-:|",
+        "The `FF equiv` column (issue #90) records the strength of the",
+        "FF-layer equivalence claim: `bilinear` for Tier 1 (the solver",
+        "emits a Poly realised by composed M_ADD / B_MUL);",
+        "`solver_structural` for Tier 2 / Tier 3 (the emitted",
+        "ClosedForm / ProductForm is structurally equal across drivers,",
+        "but forward-time `eval_at` — matrix power / bounded product —",
+        "has no weight-layer realisation). See",
+        "`dev/ff_closed_form_equivalence.md`.",
+        "",
+        "| Program | k heads | size | closed form | FF equiv | match |",
+        "|---|---:|---:|---|:-:|:-:|",
     ]
     for r in rows:
         if r.status != STATUS_COLLAPSED_CLOSED_FORM:
@@ -1107,7 +1143,8 @@ def format_report(rows: List[CatalogRow]) -> str:
         size = r.n_monomials if r.n_monomials is not None else "–"
         lines.append(
             f"| `{r.name}` | {r.n_heads} | {size} | "
-            f"`{r.poly_expr}` | {_fmt_match(r.numeric_match)} |"
+            f"`{r.poly_expr}` | `{r.ff_equiv or '–'}` | "
+            f"{_fmt_match(r.numeric_match)} |"
         )
 
     lines += [

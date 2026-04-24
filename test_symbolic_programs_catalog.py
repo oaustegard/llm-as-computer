@@ -265,6 +265,45 @@ def test_run_catalog_collapsed_rows_numeric_match():
     )
 
 
+def test_run_catalog_pins_ff_equiv_taxonomy():
+    """Issue #90 pins: the ``ff_equiv`` column records which
+    FF-equivalence claim applies per row. Tier 1 closed-form
+    (``sum_1_to_n_sym``) rides the existing bilinear theorem because
+    its emitted top is a Poly; Tier 2 / Tier 3 closed-form
+    (``power_of_2_sym``, ``fibonacci_sym``, ``factorial_sym``) get
+    the weaker ``solver_structural`` claim — structural equality at
+    the recurrence solver, but no weight-layer realisation of
+    ``Aⁿ`` / ``∏ p(k)`` at forward time. See
+    ``dev/ff_closed_form_equivalence.md``.
+    """
+    rows = {r.name: r for r in run_catalog()}
+
+    # Tier 1 Poly top — existing bilinear theorem covers it.
+    assert rows["sum_1_to_n_sym(n)"].ff_equiv == "bilinear"
+
+    # Tier 2 / Tier 3 — new scoped claim.
+    assert rows["power_of_2_sym(n)"].ff_equiv == "solver_structural"
+    assert rows["fibonacci_sym(n)"].ff_equiv == "solver_structural"
+    assert rows["factorial_sym(n)"].ff_equiv == "solver_structural"
+
+    # Every collapsed / guarded / unrolled row is bilinear.
+    for r in rows.values():
+        if r.status in ("collapsed", "collapsed_guarded",
+                        "collapsed_unrolled"):
+            assert r.ff_equiv == "bilinear", (
+                f"{r.name}: status={r.status} expected bilinear, "
+                f"got {r.ff_equiv!r}"
+            )
+
+    # Every blocked / unclassified row is n/a.
+    for r in rows.values():
+        if r.status.startswith("blocked"):
+            assert r.ff_equiv == "n/a", (
+                f"{r.name}: status={r.status} expected n/a, "
+                f"got {r.ff_equiv!r}"
+            )
+
+
 def test_run_catalog_pins_poc_collapse_counts():
     rows = {r.name: r for r in run_catalog()}
     # These two pins trace back to the issue #65 PoC text and must not drift.
