@@ -264,6 +264,18 @@ issue #90 comment lists them under "Path B" — deferred indefinitely
 unless a motivating catalog row demands forward-time closed-form
 evaluation at weight granularity.
 
+> **Update (issue #109):** Path B has since landed — see ``path_b.py``,
+> ``ff_symbolic_poly_embedding.py`` (B.1), ``ff_symbolic_recurrent.py``
+> (B.2), and ``algebraic_poly.py`` (B.3). The trigger was
+> ``fibonacci_sym(n)`` flipping its CatalogEntry's
+> ``requests_weight_layer=True`` flag — the motivator gate #107
+> demanded. The ``ff_equiv`` column gains a fourth value
+> ``bilinear_weight_layer`` for rows whose Path B realisation is
+> proven; other Tier 2/3 rows stay at ``solver_structural`` until
+> their own motivator appears. The bullets above are preserved as
+> historical context for what the obstruction shape looked like
+> before B.1/B.2/B.3 were each priced out.
+
 ## What this doc *is* worth, in one line
 
 The closed-form fragment now has the same spec shape that carried
