@@ -1018,6 +1018,103 @@ def test_bitvec_parameter_count():
     _check("n_parameters == 15", n == 15, f"got {n}")
 
 
+# ─── Closed-form equivalence (issue #90) ─────────────────────────
+#
+# Path C of the #90 design (dev/ff_closed_form_equivalence.md):
+# solver-level structural equivalence. The recurrence solver lives in
+# run_forking and dispatches arithmetic through whichever
+# arithmetic_ops it was handed — so the sibling it emits
+# (Poly / ClosedForm / ProductForm) is structurally equal under
+# DEFAULT_ARITHMETIC_OPS and FF_ARITHMETIC_OPS because the Poly-level
+# primitives agree by #69.
+#
+# Path A of the same design: boundary numeric agreement. ClosedForm /
+# ProductForm eval_at performs the non-polynomial step (iterated
+# matrix recurrence / bounded product) and returns an integer, which
+# matches NumPyExecutor on every concrete bindings in the validation
+# set. No weight-layer claim for Aⁿ / ∏ — that's Path B, deferred.
+
+
+def _closed_form_rows():
+    """Four catalog rows #89 closes into collapsed_closed_form."""
+    import programs as P
+    return [
+        # name, make_fn, validation n-values (from #88 design doc)
+        ("sum_1_to_n_sym",  P.make_sum_1_to_n_sym,  (1, 2, 5, 10, 20)),
+        ("power_of_2_sym",  P.make_power_of_2_sym,  (0, 1, 4, 8, 10)),
+        ("fibonacci_sym",   P.make_fibonacci_sym,   (1, 2, 5, 10, 15)),
+        ("factorial_sym",   P.make_factorial_sym,   (1, 2, 5, 7, 10)),
+    ]
+
+
+def test_equivalence_closed_form_structural():
+    """For each *_sym(n) catalog row, the sibling emitted by
+    evaluate_program_forking is value-equal to run_forking's native
+    output (Poly for Tier 1, ClosedForm for Tier 2, ProductForm for
+    Tier 3). Free claim — the solver runs over bilinear-equal Poly
+    arithmetic either way."""
+    from closed_form import ClosedForm, ProductForm
+
+    # One representative n per row — structural equality doesn't
+    # depend on the concrete value, but we pick a non-trivial one so
+    # the emitted tuple is the full shape (not a degenerate base case).
+    shapes = {
+        "sum_1_to_n_sym": (5, Poly),
+        "power_of_2_sym": (4, ClosedForm),
+        "fibonacci_sym":  (5, ClosedForm),
+        "factorial_sym":  (4, ProductForm),
+    }
+    for name, make_fn, _ns in _closed_form_rows():
+        n, expected_type = shapes[name]
+        prog, _expected = make_fn(n)
+        native = run_forking(prog, input_mode="symbolic",
+                             solve_recurrences=True)
+        fs = ff.evaluate_program_forking(prog, input_mode="symbolic")
+        _check(
+            f"closed_form.struct.status[{name}]",
+            native.status == "closed_form" and fs.status == "closed_form",
+            f"native={native.status!r} ff={fs.status!r}",
+        )
+        _check(
+            f"closed_form.struct.type[{name}]",
+            isinstance(native.top, expected_type)
+            and isinstance(fs.top, expected_type),
+            f"native={type(native.top).__name__} "
+            f"ff={type(fs.top).__name__} expected={expected_type.__name__}",
+        )
+        _check(
+            f"closed_form.struct.eq[{name}]",
+            native.top == fs.top,
+            f"native={native.top!r}\n    ff    ={fs.top!r}",
+        )
+
+
+def test_equivalence_closed_form_numeric():
+    """For each row at every n in its validation set,
+    evaluate_program_forking's top.eval_at agrees with NumPyExecutor.
+    This is the boundary-step claim — ClosedForm.eval_at iterates the
+    integer matrix recurrence, ProductForm.eval_at walks the bounded
+    product; neither is a bilinear form in the PUSH variables, but the
+    numeric agreement is bit-exact."""
+    np_exec = NumPyExecutor()
+    for name, make_fn, ns in _closed_form_rows():
+        for n in ns:
+            prog, expected = make_fn(n)
+            fs = ff.evaluate_program_forking(prog, input_mode="symbolic")
+            try:
+                sym_val = fs.top.eval_at(fs.bindings)
+            except Exception as e:  # pragma: no cover
+                _fail(f"closed_form.numeric[{name}(n={n})]",
+                      f"eval_at raised: {type(e).__name__}: {e}")
+                continue
+            np_top = np_exec.execute(prog).steps[-1].top
+            _check(
+                f"closed_form.numeric[{name}(n={n})]",
+                sym_val == np_top == expected,
+                f"sym={sym_val} np={np_top} expected={expected}",
+            )
+
+
 # ─── Blocked-opcode handling ──────────────────────────────────────
 
 # ─── ModPoly / mod-2³² equivalence (issue #78 option (b)) ────────
@@ -1424,6 +1521,8 @@ def main():
         test_equivalence_is_power_of_2_structural,
         test_equivalence_bitvec_numeric,
         test_bitvec_parameter_count,
+        test_equivalence_closed_form_structural,
+        test_equivalence_closed_form_numeric,
         test_modpoly_primitives,
         test_symbolic_primitives_mod,
         test_modpoly_catalog_structural,
