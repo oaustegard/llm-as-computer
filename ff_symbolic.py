@@ -790,6 +790,15 @@ _SCOPE_OPS = {
     isa.OP_AND, isa.OP_OR, isa.OP_XOR,
     isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U,
     isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT,
+    # Issue #105: LOCAL slots are transparent to the FF dispatch — a slot
+    # just stores and retrieves whatever stack value was written to it
+    # (Poly / BitVec / RationalPoly / IndicatorPoly / SymbolicRemainder),
+    # invoking no FF weight matrix. The equivalence claim from #69
+    # extends unchanged: each LOCAL_* step routes a single symbolic
+    # value through the locals table, so every arithmetic composition
+    # still bottoms out at the same M_ADD / M_SUB / B_MUL (etc.) call
+    # site as it would under pure stack manipulation.
+    isa.OP_LOCAL_GET, isa.OP_LOCAL_SET, isa.OP_LOCAL_TEE,
 }
 
 
@@ -824,6 +833,7 @@ def evaluate_program(prog) -> SymbolicForwardResult:
     form carried by :class:`RationalPoly` / :class:`SymbolicRemainder`).
     """
     stack: List[RationalStackValue] = []
+    locals_: Dict[int, RationalStackValue] = {}
     bindings: Dict[int, int] = {}
     next_var = 0
     n_heads = 0
@@ -892,8 +902,15 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                 ai = _require_int_ast(a, "SUB"); bi = _require_int_ast(b, "SUB")
                 stack.append(symbolic_bit_arith(bi, ai, isa.OP_SUB))
             else:
-                stack.append(symbolic_sub(_require_poly(a, "SUB"),
-                                          _require_poly(b, "SUB")))
+                # ``symbolic_sub`` takes ``(pa=top, pb=SP-1)`` and returns
+                # ``pb - pa = SP-1 - top`` (WASM SUB). Mirrors the forking
+                # wrapper ``FF_ARITHMETIC_OPS.sub = λa,b: symbolic_sub(b, a)``
+                # and matches ``DIV_S`` / ``REM_S`` / ``symbolic_cmp``
+                # below. Issue #105 exposed this via ``gen_mixed_signs``,
+                # whose ``emit_negate`` sequence produces a negative
+                # coefficient only when the subtrahend-order is correct.
+                stack.append(symbolic_sub(_require_poly(b, "SUB"),
+                                          _require_poly(a, "SUB")))
         elif op == isa.OP_MUL:
             b = _pop(); a = _pop()
             if isinstance(a, BitVec) or isinstance(b, BitVec):
@@ -957,6 +974,28 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                 raise IndexError("rot needs 3 entries")
             a, b, c = stack[-3], stack[-2], stack[-1]
             stack[-3], stack[-2], stack[-1] = b, c, a
+        elif op == isa.OP_LOCAL_GET:
+            # FF invariant: the slot holds the identical symbolic value
+            # that was written to it — no FF weight matrix is applied on
+            # read. The Poly / BitVec / RationalPoly / IndicatorPoly
+            # identity is preserved by reference, so downstream ADD / SUB
+            # / MUL / … dispatch is unchanged from the pure-stack path.
+            slot = int(instr.arg)
+            if slot not in locals_:
+                raise IndexError(f"LOCAL_GET of uninitialized slot {slot}")
+            stack.append(locals_[slot])
+        elif op == isa.OP_LOCAL_SET:
+            # Store pop-top into the slot. No algebra over the value —
+            # the FF dispatch never inspects slot contents; it only
+            # routes the write on SET and the read on GET.
+            slot = int(instr.arg)
+            locals_[slot] = _pop()
+        elif op == isa.OP_LOCAL_TEE:
+            # Peek-and-store: slot mirrors current top without popping.
+            slot = int(instr.arg)
+            if not stack:
+                raise IndexError("LOCAL_TEE on empty stack")
+            locals_[slot] = stack[-1]
         else:  # pragma: no cover — guarded by _SCOPE_OPS above
             raise BlockedOpcodeForSymbolic(f"unreachable: op {op}")
 
@@ -1024,6 +1063,12 @@ _SCOPE_OPS_MOD = {
     isa.OP_PUSH, isa.OP_POP, isa.OP_DUP, isa.OP_HALT, isa.OP_NOP,
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT,
+    # Issue #105: LOCAL slots are polynomial-closed — a slot stores and
+    # retrieves whatever ModPoly stack value was written. They invoke
+    # no bilinear form, so the mod-2³² homomorphism (``ModPoly.from_poly
+    # ∘ evaluate_program == evaluate_program_mod`` on the collapsed-Poly
+    # catalog) extends unchanged once both drivers carry a locals table.
+    isa.OP_LOCAL_GET, isa.OP_LOCAL_SET, isa.OP_LOCAL_TEE,
 }
 
 
@@ -1050,6 +1095,7 @@ def evaluate_program_mod(prog) -> SymbolicForwardResultMod:
     theorem verified by :func:`test_ff_symbolic.test_modpoly_equivalence`.
     """
     stack: List[ModPoly] = []
+    locals_: Dict[int, ModPoly] = {}
     bindings: Dict[int, int] = {}
     next_var = 0
     n_heads = 0
@@ -1086,7 +1132,11 @@ def evaluate_program_mod(prog) -> SymbolicForwardResultMod:
             stack.append(symbolic_add_mod(a, b))
         elif op == isa.OP_SUB:
             b = stack.pop(); a = stack.pop()
-            stack.append(symbolic_sub_mod(a, b))
+            # ``symbolic_sub_mod`` takes ``(pa=top, pb=SP-1)`` and returns
+            # ``pb - pa = SP-1 - top``, matching WASM SUB and the
+            # ``FF_ARITHMETIC_OPS.sub`` wrapper. Same ordering fix as the
+            # Poly driver above (issue #105).
+            stack.append(symbolic_sub_mod(b, a))
         elif op == isa.OP_MUL:
             b = stack.pop(); a = stack.pop()
             stack.append(symbolic_mul_mod(a, b))
@@ -1103,6 +1153,30 @@ def evaluate_program_mod(prog) -> SymbolicForwardResultMod:
                 raise IndexError("rot needs 3 entries")
             a, b, c = stack[-3], stack[-2], stack[-1]
             stack[-3], stack[-2], stack[-1] = b, c, a
+        elif op == isa.OP_LOCAL_GET:
+            # Mod-2³² slot read: return the stored ModPoly unchanged.
+            # No bilinear form is invoked, so mod-32 reduction is a
+            # no-op on the GET edge — the coefficients were already
+            # reduced when the value was produced by the arithmetic
+            # primitive that wrote it.
+            slot = int(instr.arg)
+            if slot not in locals_:
+                raise IndexError(f"LOCAL_GET of uninitialized slot {slot}")
+            stack.append(locals_[slot])
+        elif op == isa.OP_LOCAL_SET:
+            # Mod-2³² slot write: pop-top into the slot. The ModPoly's
+            # invariant (coefficients in [0, 2³²)) is preserved by
+            # reference; SET applies no algebra.
+            slot = int(instr.arg)
+            if not stack:
+                raise IndexError("LOCAL_SET on empty stack")
+            locals_[slot] = stack.pop()
+        elif op == isa.OP_LOCAL_TEE:
+            # Mod-2³² peek-and-store: slot mirrors current top.
+            slot = int(instr.arg)
+            if not stack:
+                raise IndexError("LOCAL_TEE on empty stack")
+            locals_[slot] = stack[-1]
         else:  # pragma: no cover — guarded by _SCOPE_OPS_MOD above
             raise BlockedOpcodeForSymbolic(f"unreachable: op {op}")
 
