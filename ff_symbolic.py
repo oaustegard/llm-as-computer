@@ -1222,6 +1222,21 @@ def evaluate_program_forking(prog, *, input_mode: str = "symbolic") -> ForkingRe
                        arithmetic_ops=FF_ARITHMETIC_OPS)
 
 
+# ─── Path B (issue #109) — weight-layer realisation of ClosedForm /
+# ProductForm. Path B is opt-in via this entrypoint; the default
+# ``evaluate_program_forking`` above stays Path A (#107). See
+# :mod:`path_b` for the dispatcher and :mod:`ff_symbolic_poly_embedding`
+# / :mod:`ff_symbolic_recurrent` / :mod:`algebraic_poly` for the three
+# sub-paths.
+from path_b import (  # noqa: E402  — late import to avoid a cycle
+    PATH_B_OUT_OF_SCOPE_EXCEPTION,
+    PathBOutOfScope,
+    PathBResult,
+    evaluate_program_forking_weight_layer,
+    path_b_in_scope,
+)
+
+
 __all__ = [
     "BlockedOpcodeForSymbolic",
     "RangeCheckFailure",
@@ -1246,4 +1261,10 @@ __all__ = [
     "evaluate_program_mod",
     "evaluate_program_forking",
     "range_check",
+    # Path B (issue #109)
+    "PATH_B_OUT_OF_SCOPE_EXCEPTION",
+    "PathBOutOfScope",
+    "PathBResult",
+    "evaluate_program_forking_weight_layer",
+    "path_b_in_scope",
 ]
