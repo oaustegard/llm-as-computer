@@ -1189,6 +1189,11 @@ _POLY_OPS = {
     isa.OP_ADD, isa.OP_SUB, isa.OP_MUL,
     isa.OP_DIV_S, isa.OP_REM_S,
     isa.OP_SWAP, isa.OP_OVER, isa.OP_ROT, isa.OP_NOP,
+    # Local-variable slots are polynomial-closed: a slot just stores and
+    # retrieves whatever stack value was written to it. Adding them here
+    # unlocks compilation strategies that would otherwise be blocked by
+    # the top-3 reach limit of ROT/SWAP (see issue #100).
+    isa.OP_LOCAL_GET, isa.OP_LOCAL_SET, isa.OP_LOCAL_TEE,
 } | _CMP_OPS | _BITVEC_OPCODES
 # Branch ops the forking executor additionally handles.
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
@@ -1265,6 +1270,7 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
     programs with JZ/JNZ.
     """
     stack: List[RationalStackValue] = []
+    locals_: Dict[int, RationalStackValue] = {}
     bindings: Dict[int, int] = {}
     next_var = 0
     n_heads = 0
@@ -1410,6 +1416,20 @@ def run_symbolic(prog: List[isa.Instruction]) -> SymbolicResult:
             # [a, b, c] -> [b, c, a] (matches test_algorithm semantics)
             a, b, c = stack[-3], stack[-2], stack[-1]
             stack[-3], stack[-2], stack[-1] = b, c, a
+        elif op == isa.OP_LOCAL_GET:
+            if arg not in locals_:
+                raise SymbolicStackUnderflow(
+                    f"LOCAL_GET of uninitialized slot {arg}"
+                )
+            stack.append(locals_[arg])
+        elif op == isa.OP_LOCAL_SET:
+            if not stack:
+                raise SymbolicStackUnderflow("LOCAL_SET on empty stack")
+            locals_[arg] = _pop()
+        elif op == isa.OP_LOCAL_TEE:
+            if not stack:
+                raise SymbolicStackUnderflow("LOCAL_TEE on empty stack")
+            locals_[arg] = stack[-1]
         elif op in _BIT_BIN_OPS:
             # Binary bit op: ``a = SP-1``, ``b = top``. BitVec wraps each
             # operand verbatim (no simplification) — see module docstring.
