@@ -73,7 +73,15 @@ def _iterate_closed_form(top: ClosedForm, bindings) -> Tuple[int, int]:
             f"B.2: ClosedForm b must be length {m}; got {len(top.b)}"
         )
     state = [int(p.eval_at(bindings)) for p in top.s_0]
-    iterations = 0
+    # Initial-state load: one FF microstep per s_0 slot beyond the
+    # first. A first-order recurrence (m=1) has the initial value as
+    # part of the embedding — no prep call. A higher-order recurrence
+    # (m≥2, e.g. fibonacci's (F(0), F(1))) needs (m-1) preliminary FF
+    # calls to populate the additional state slots in the residual
+    # stream before the recurrence body fires. This is what closes
+    # the off-by-one between fibonacci's trip_count (n-1) and the
+    # caller's n: iter = trip + (m - 1) = (n-1) + 1 = n.
+    iterations = max(m - 1, 0)
     for _ in range(n):
         # One FF microstep: state' = A · state + b. In a real
         # transformer this is a single attention+FF call with the

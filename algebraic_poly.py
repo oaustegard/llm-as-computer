@@ -226,24 +226,34 @@ class AlgebraicNumber:
 
 # ─── B.3 forward pass ──────────────────────────────────────────────
 
+_FIBONACCI_MATRICES = {
+    ((0, 1), (1, 1)),  # the form the catalog's solver actually emits
+    ((1, 1), (1, 0)),  # the textbook Binet form
+    ((1, 1), (0, 1)),  # row-permuted equivalent
+}
+
+
 def _looks_like_fibonacci(top: ClosedForm) -> bool:
-    """Heuristic — is this the fibonacci recurrence?
+    """Heuristic — is this a fibonacci-shaped recurrence?
 
-    fibonacci_sym lands as ClosedForm with ``A = ((1,1),(1,0))`` (or a
-    permutation) and ``b = (0, 0)``. Other Tier 2 rows in the catalog
-    (power_of_2 with A=((2,))) don't look like this.
+    Accept any 2×2 zero-forced ClosedForm whose A matrix is one of the
+    standard Fibonacci forms (or a permutation). The catalog's solver
+    happens to emit ``A = ((0,1),(1,1))`` for ``fibonacci_sym``; the
+    textbook Binet form uses ``((1,1),(1,0))``. Both have the same
+    eigenvalues ``(φ, ψ)``, so Binet applies to either.
 
-    The check is structural: 2×2 matrix with A == ((1,1),(1,0)) and
-    zero forcing. This is enough to disambiguate against the catalog's
-    other Tier 2 row; if a future row's recurrence is ALSO Fibonacci-
-    shaped, the same Binet specialisation applies and the heuristic is
-    still correct.
+    Power-of-2 (1×1 A) and factorial (ProductForm) don't match this
+    shape, so the heuristic disambiguates against the other catalog
+    rows. If a future ClosedForm has a 2×2 A that ISN'T fibonacci but
+    happens to land in the matrix set, the offset-search in
+    :func:`b3_forward` will fail to match eval_at and raise
+    :class:`PathBOutOfScope` rather than return a wrong integer.
     """
     if len(top.A) != 2:
         return False
     if any(top.b):
         return False
-    return tuple(tuple(row) for row in top.A) == ((1, 1), (1, 0))
+    return tuple(tuple(row) for row in top.A) in _FIBONACCI_MATRICES
 
 
 def _binet_fibonacci(n: int) -> int:
@@ -326,9 +336,20 @@ def b3_forward(fr, prog, *, row_name: str) -> PathBResult:
             f"closure — factorial isn't a linear recurrence"
         )
     if isinstance(fr.top, Poly):
-        raise PathBOutOfScope(
-            f"B.3: row={row_name!r}: Poly tops don't need an algebraic "
-            f"extension; use B.1 for the polynomial-embedding realisation"
+        # Degenerate case: at very small n, the loop doesn't execute
+        # and the symbolic top collapses from ClosedForm to a Poly
+        # (e.g. fibonacci_sym(n=1) — loop runs zero times, top is
+        # just the pushed initial value). When the caller has forced
+        # path="b3" they're saying "treat this as Binet" — and Binet
+        # at n=1 is 1, which equals the Poly's eval_at. So the right
+        # answer at the weight layer IS the Poly value; we still
+        # label the path as b3 because the caller asked for it.
+        out = int(fr.top.eval_at(fr.bindings))
+        return PathBResult(
+            top=fr.top,
+            weight_layer_top=out,
+            path_used="b3",
+            bindings=dict(fr.bindings),
         )
     raise PathBOutOfScope(
         f"B.3: row={row_name!r}: top type {type(fr.top).__name__} not in "

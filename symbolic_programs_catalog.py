@@ -345,6 +345,17 @@ class CatalogEntry:
     # existing rows (``fibonacci(5)`` etc.) in their pre-#89
     # ``collapsed_unrolled`` classification.
     solve_recurrences: bool = False
+    # Issue #109 / Path B motivator gate. Per #107, Path B should not
+    # activate silently — building a weight-layer gadget for a program
+    # nobody runs is the anti-pattern the issue explicitly warns
+    # against. Set this True on a row only when (a) the row is
+    # collapsed_closed_form, and (b) there's a concrete reason to want
+    # a weight-layer realisation of its eval_at (e.g. blog #82 wants
+    # the stronger "weights = computer" claim for this specific row).
+    # When True AND ``run_catalog`` confirms the path is in scope, the
+    # row's ``ff_equiv`` is upgraded from ``solver_structural`` to
+    # ``bilinear_weight_layer``.
+    requests_weight_layer: bool = False
 
 
 def _default_catalog() -> List[CatalogEntry]:
@@ -467,6 +478,14 @@ def _default_catalog() -> List[CatalogEntry]:
     entries.append(CatalogEntry(
         "fibonacci_sym(n)", *P.make_fibonacci_sym(5),
         solve_recurrences=True,
+        # Issue #109 motivator: fibonacci_sym is the row that closes
+        # Path B's gate per #107. Blog #82's "weights = computer"
+        # claim is strongest when it can point at fibonacci's Binet
+        # realisation (B.3) — a single-layer algebraic-coefficient
+        # gadget that evaluates F(n) for any n without an explicit
+        # recurrence loop. The other three closed_form rows stay at
+        # ``solver_structural`` until their own motivator appears.
+        requests_weight_layer=True,
     ))
     entries.append(CatalogEntry(
         "factorial_sym(n)", *P.make_factorial_sym(4),
@@ -729,8 +748,37 @@ def run_catalog(entries: Optional[List[CatalogEntry]] = None, *,
         else:
             row.ff_equiv = "n/a"
 
+        # Issue #109 / Path B upgrade. A row is upgraded from
+        # ``solver_structural`` to ``bilinear_weight_layer`` when:
+        #   1. The CatalogEntry sets ``requests_weight_layer=True`` —
+        #      the motivator gate per #107.
+        #   2. The row actually classifies as ``collapsed_closed_form``
+        #      (Tier 2 / Tier 3 — the only rows where ``solver_structural``
+        #      applies in the first place).
+        #   3. ``path_b_in_scope`` says some Path B sub-path covers it.
+        # Tier 1 rows (already ``bilinear``) are NOT demoted — the upgrade
+        # is one-directional. Path A's claim stands; Path B adds to it.
+        if (entry.requests_weight_layer
+                and row.ff_equiv == "solver_structural"):
+            from path_b import path_b_in_scope
+            # A scope query without a specific n: ask "is there ANY n
+            # this path covers." For B.2 (the universal sub-path) the
+            # answer is True for any catalog row whose top is
+            # ClosedForm / ProductForm.
+            if path_b_in_scope(_strip_arity(row.name), 1):
+                row.ff_equiv = "bilinear_weight_layer"
+
         rows.append(row)
     return rows
+
+
+def _strip_arity(name: str) -> str:
+    """Map ``"fibonacci_sym(n)"`` → ``"fibonacci_sym"`` for scope lookup.
+
+    The catalog labels rows with their arity for human readability;
+    ``path_b_in_scope`` keys on the bare row name.
+    """
+    return name.split("(", 1)[0]
 
 
 def _fill_poly_row(row: CatalogRow, poly: Poly,

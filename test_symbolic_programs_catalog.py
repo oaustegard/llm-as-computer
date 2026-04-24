@@ -266,14 +266,21 @@ def test_run_catalog_collapsed_rows_numeric_match():
 
 
 def test_run_catalog_pins_ff_equiv_taxonomy():
-    """Issue #90 pins: the ``ff_equiv`` column records which
+    """Issue #90 / #109 pins: the ``ff_equiv`` column records which
     FF-equivalence claim applies per row. Tier 1 closed-form
     (``sum_1_to_n_sym``) rides the existing bilinear theorem because
     its emitted top is a Poly; Tier 2 / Tier 3 closed-form
-    (``power_of_2_sym``, ``fibonacci_sym``, ``factorial_sym``) get
-    the weaker ``solver_structural`` claim — structural equality at
-    the recurrence solver, but no weight-layer realisation of
-    ``Aⁿ`` / ``∏ p(k)`` at forward time. See
+    (``power_of_2_sym``, ``factorial_sym``) get the weaker
+    ``solver_structural`` claim — structural equality at the
+    recurrence solver, but no weight-layer realisation of ``Aⁿ`` /
+    ``∏ p(k)`` at forward time.
+
+    ``fibonacci_sym`` is the Path B motivator (issue #109): its
+    CatalogEntry sets ``requests_weight_layer=True``, so
+    ``run_catalog`` upgrades its label to ``bilinear_weight_layer``
+    once a Path B sub-path lands that covers it (B.2 universally,
+    B.3 via Binet specifically). Other Tier 2/3 rows stay at
+    ``solver_structural`` until their own motivator appears. See
     ``dev/ff_closed_form_equivalence.md``.
     """
     rows = {r.name: r for r in run_catalog()}
@@ -281,10 +288,14 @@ def test_run_catalog_pins_ff_equiv_taxonomy():
     # Tier 1 Poly top — existing bilinear theorem covers it.
     assert rows["sum_1_to_n_sym(n)"].ff_equiv == "bilinear"
 
-    # Tier 2 / Tier 3 — new scoped claim.
+    # Tier 2 / Tier 3 — solver_structural unless a Path B motivator
+    # is set on the entry (issue #109).
     assert rows["power_of_2_sym(n)"].ff_equiv == "solver_structural"
-    assert rows["fibonacci_sym(n)"].ff_equiv == "solver_structural"
     assert rows["factorial_sym(n)"].ff_equiv == "solver_structural"
+
+    # fibonacci_sym is the #109 motivator row — upgraded to
+    # bilinear_weight_layer because Path B (B.3 Binet) covers it.
+    assert rows["fibonacci_sym(n)"].ff_equiv == "bilinear_weight_layer"
 
     # Every collapsed / guarded / unrolled row is bilinear.
     for r in rows.values():
