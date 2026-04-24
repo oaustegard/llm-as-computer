@@ -479,7 +479,62 @@ def _default_catalog() -> List[CatalogEntry]:
     # a two-case GuardedPoly rather than blocking on the opcode.
     entries.append(CatalogEntry("native_max(3,5)", *P.make_native_max(3, 5)))
 
+    # Generated entries (issue #96): poly → program → symbolic round-trip.
+    entries.extend(_generated_catalog())
+
     return entries
+
+
+
+def _generated_catalog() -> List[CatalogEntry]:
+    """Generated stress-test entries for issue #96.
+
+    Each entry compiles a hand-chosen :class:`Poly` via
+    :func:`poly_to_program` and is expected to classify as
+    ``STATUS_COLLAPSED`` with ``numeric_match=True``.
+
+    All generated programs use ``PUSH 0; LOCAL_SET i`` for each variable,
+    so the symbolic executor binds every variable to 0.  The six shapes
+    cover the stress-test matrix in the issue spec:
+
+    * High degree, single variable — deep DUP/MUL chains (x0⁵)
+    * Many variables — wide PUSH + local stack (x0·x1·x2·x3)
+    * Many monomials — exercises ADD chains (x0² + x0·x1 + x1² + x0 + x1)
+    * Mixed signs — negation trick (3·x0·x1 − 2·x0² + x1)
+    * Large coefficient — long DUP/ADD scaling (10·x0)
+    * Four-variable cross-product — contiguous-index coverage
+      (x0·x1 + x2·x3, replacing the non-contiguous x0·x3 sketch
+      from the issue which fails the contiguity validator)
+    """
+    from poly_compiler import poly_to_program  # sibling module in this repo
+
+    def _entry(name: str, poly: Poly) -> CatalogEntry:
+        prog = poly_to_program(poly)
+        # poly evaluates to 0 at the binding point (all vars bound to 0
+        # by the PUSH 0 preamble), so expected=0 is the ground-truth result.
+        return CatalogEntry(name=name, prog=prog, expected=0)
+
+    x0, x1, x2, x3 = (Poly.variable(i) for i in range(4))
+
+    return [
+        # Shape 1: high degree, 1 var — deep DUP/MUL chains
+        _entry("gen_x0_fifth", x0 * x0 * x0 * x0 * x0),
+        # Shape 2: many variables — wide PUSH + local slots
+        _entry("gen_x0x1x2x3", x0 * x1 * x2 * x3),
+        # Shape 3: many monomials — exercises ADD chains
+        _entry("gen_sum_of_five_terms", x0 * x0 + x0 * x1 + x1 * x1 + x0 + x1),
+        # Shape 4: mixed signs — negation trick exercises emit_negate
+        _entry(
+            "gen_mixed_signs",
+            Poly({((0, 1), (1, 1)): 3, ((0, 2),): -2, ((1, 1),): 1}),
+        ),
+        # Shape 5: large coefficient — long DUP/ADD scaling chain
+        _entry("gen_10x0", Poly({((0, 1),): 10})),
+        # Shape 6: four-variable cross-product — covers contiguous indices 0-3
+        # (x0·x3 alone would fail the contiguity validator, so we include
+        # all four indices via x0·x1 + x2·x3)
+        _entry("gen_x0x1_plus_x2x3", x0 * x1 + x2 * x3),
+    ]
 
 
 # ─── Runner + row ────────────────────────────────────────────────
@@ -1100,4 +1155,5 @@ __all__ = [
     "format_report",
     "poly_to_expr",
     "run_catalog",
+    "_generated_catalog",
 ]
