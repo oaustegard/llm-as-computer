@@ -748,26 +748,31 @@ FF_ARITHMETIC_OPS = ArithmeticOps(
     cmp_le_s=lambda a, b: symbolic_cmp(b, a, isa.OP_LE_S),
     cmp_ge_s=lambda a, b: symbolic_cmp(b, a, isa.OP_GE_S),
     eqz=lambda a: symbolic_eqz(a),
-    # Bit-vector primitives (issue #77). Arg convention matches the
-    # rest: ``a`` = top, ``b`` = SP-1. ``symbolic_bit_*`` takes
-    # ``(pa, pb, op)`` in FF order (pa=top, pb=SP-1), so we pass
-    # ``(b, a)`` where relevant. Unary bit ops pass the single operand
-    # straight through.
-    bit_and=lambda a, b: symbolic_bit_binary(a, b, isa.OP_AND),
-    bit_or=lambda a, b: symbolic_bit_binary(a, b, isa.OP_OR),
-    bit_xor=lambda a, b: symbolic_bit_binary(a, b, isa.OP_XOR),
-    bit_shl=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHL),
-    bit_shr_s=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHR_S),
-    bit_shr_u=lambda a, b: symbolic_bit_binary(a, b, isa.OP_SHR_U),
+    # Bit-vector primitives (issue #77). The forking executor's convention
+    # is ``op(a, b)`` with ``a`` = SP-1 and ``b`` = top (same as the Poly
+    # primitives above). ``symbolic_bit_binary`` / ``symbolic_bit_arith``
+    # take ``(pa, pb, op)`` in FF order (pa=top, pb=SP-1) and store them
+    # as ``(pb, pa) = (SP-1, top)`` = PUSH order, so we pass ``(b, a)``
+    # — identical flip to the ``sub`` / ``div_s`` / ``cmp_*`` wrappers
+    # above. Passing ``(a, b)`` unswapped (the pre-#108 bug) put operands
+    # in ``(top, SP-1)`` order, silently breaking non-commutative ops
+    # like SHL (`3 << 2` returned `16` instead of `12`).
+    bit_and=lambda a, b: symbolic_bit_binary(b, a, isa.OP_AND),
+    bit_or=lambda a, b: symbolic_bit_binary(b, a, isa.OP_OR),
+    bit_xor=lambda a, b: symbolic_bit_binary(b, a, isa.OP_XOR),
+    bit_shl=lambda a, b: symbolic_bit_binary(b, a, isa.OP_SHL),
+    bit_shr_s=lambda a, b: symbolic_bit_binary(b, a, isa.OP_SHR_S),
+    bit_shr_u=lambda a, b: symbolic_bit_binary(b, a, isa.OP_SHR_U),
     bit_clz=lambda a: symbolic_bit_unary(a, isa.OP_CLZ),
     bit_ctz=lambda a: symbolic_bit_unary(a, isa.OP_CTZ),
     bit_popcnt=lambda a: symbolic_bit_unary(a, isa.OP_POPCNT),
-    # Hybrid arithmetic: at this callsite ``a`` = top, ``b`` = SP-1
-    # (mirroring how the Poly path calls ``sub(b, a)`` = ``b − a``).
-    # ``symbolic_bit_arith`` does the same swap internally.
-    bit_add=lambda a, b: symbolic_bit_arith(a, b, isa.OP_ADD),
-    bit_sub=lambda a, b: symbolic_bit_arith(a, b, isa.OP_SUB),
-    bit_mul=lambda a, b: symbolic_bit_arith(a, b, isa.OP_MUL),
+    # Hybrid arithmetic lifted into the BitVec AST — same flip as above,
+    # for the same reason. Under the pre-#108 bug the commutative cases
+    # (ADD / MUL) were cosmetically wrong (structural-equality failure
+    # only); SUB was also silently numerically wrong.
+    bit_add=lambda a, b: symbolic_bit_arith(b, a, isa.OP_ADD),
+    bit_sub=lambda a, b: symbolic_bit_arith(b, a, isa.OP_SUB),
+    bit_mul=lambda a, b: symbolic_bit_arith(b, a, isa.OP_MUL),
 )
 
 
@@ -936,10 +941,15 @@ def evaluate_program(prog) -> SymbolicForwardResult:
             else:
                 ai = _require_int_ast(a, name); bi = _require_int_ast(b, name)
                 # is_power_of_2 composes POPCNT (BitVec) with PUSH 1 (Poly).
-                # Build the (vb − va) = (b − a) difference as a BitVec AST
-                # and wrap in IndicatorPoly; matches the poly path's semantics.
+                # Build the (vb − va) difference as a BitVec AST in PUSH
+                # order (operands[0] = SP-1 = vb, operands[1] = top = va)
+                # so ``_apply_bitop("SUB", [vb, va])`` returns ``vb − va``
+                # and matches the Poly path's ``symbolic_cmp(b, a).poly =
+                # pb − pa = SP-1 − top``. Pre-#108 this stored
+                # ``(bi, ai) = (top, SP-1)``, inverting the sign — masked
+                # for EQ (``x == 0 ⇔ −x == 0``), but wrong for LT/LE/GT/GE.
                 stack.append(IndicatorPoly(
-                    poly=BitVec(op="SUB", operands=(bi, ai)),
+                    poly=BitVec(op="SUB", operands=(ai, bi)),
                     relation=_OP_RELATION[op],
                 ))
         elif op == isa.OP_EQZ:
@@ -950,13 +960,16 @@ def evaluate_program(prog) -> SymbolicForwardResult:
                 ai = _require_int_ast(a, "EQZ")
                 stack.append(IndicatorPoly(poly=ai, relation=REL_EQ))
         elif op in _BITBIN_OP_NAME:
-            # Binary bit op (issue #77). Same pop order as arithmetic:
-            # a = top, b = SP-1. ``symbolic_bit_binary`` takes (pa=top,
-            # pb=SP-1) and stores (left=SP-1, right=top) in the AST.
+            # Binary bit op (issue #77). ``_pop()`` order: ``b`` = top,
+            # ``a`` = SP-1. ``symbolic_bit_binary`` takes ``(pa=top,
+            # pb=SP-1)`` and stores ``(pb, pa) = (SP-1, top)`` = PUSH
+            # order, so we pass ``(b, a)``. Pre-#108 passed ``(a, b)``,
+            # producing ``(top, SP-1)`` — silently wrong for
+            # non-commutative ops (SHL ``3 << 2`` returned ``16``).
             name = isa.OP_NAMES.get(op, f"?{op}")
             b = _require_int_ast(_pop(), name)
             a = _require_int_ast(_pop(), name)
-            stack.append(symbolic_bit_binary(a, b, op))
+            stack.append(symbolic_bit_binary(b, a, op))
         elif op in _BITUN_OP_NAME:
             name = isa.OP_NAMES.get(op, f"?{op}")
             a = _require_int_ast(_pop(), name)
