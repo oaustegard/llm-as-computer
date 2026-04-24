@@ -545,6 +545,17 @@ Listing these explicitly so the PR description stays honest:
   `RationalPoly`.
 - **Bitwise** (AND, OR, XOR, shifts, rotates) — different algebra (mod-2
   bilinear forms over bit decompositions); out of scope.
+- **Closed-form loop tops** (`ClosedForm` / `ProductForm` from issue
+  #89) — the bilinear-form equivalence theorem is silent on forward-time
+  matrix exponentiation / bounded product. Issue #90 addresses the gap
+  with a scoped theorem: Tier 1 closed forms ride this doc's theorem
+  directly (the solver emits a Poly realised by composed `M_ADD` /
+  `B_MUL`); Tier 2 / Tier 3 get a weaker "solver-level structural
+  equivalence" claim in `dev/ff_closed_form_equivalence.md` plus
+  boundary numeric agreement via `eval_at`. Weight-layer realisation
+  of `Aⁿ` / `∏ p(k)` would require a polynomial-embedding or
+  recurrent-FF extension beyond the single-layer bilinear-form story;
+  explicitly out of scope.
 - **Unary ops** (CLZ, CTZ, POPCNT, ABS, NEG) — some are polynomial
   (NEG), some aren't (CLZ/CTZ). Uniform treatment would require a
   follow-up issue.
