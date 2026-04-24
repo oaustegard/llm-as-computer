@@ -132,6 +132,7 @@ class _Path:
     visited_branches: frozenset = field(default_factory=frozenset)
     loop_unrolled: bool = False  # True if this path ever took a back-edge
     halted_top: Optional["RationalStackValue"] = None
+    locals_: Dict[int, "RationalStackValue"] = field(default_factory=dict)
 
     def with_(self, **kwargs) -> "_Path":
         """Return a copy with selected fields replaced."""
@@ -140,6 +141,7 @@ class _Path:
             bindings=dict(self.bindings),
             n_heads=self.n_heads, visited_branches=self.visited_branches,
             loop_unrolled=self.loop_unrolled, halted_top=self.halted_top,
+            locals_=dict(self.locals_),
         )
         base.update(kwargs)
         return _Path(**base)
@@ -320,7 +322,7 @@ def run_forking(prog: List[isa.Instruction], *,
                 # Non-branch, non-halt → advance n_heads and apply op.
                 if op != isa.OP_JZ and op != isa.OP_JNZ:
                     try:
-                        stack = _apply_poly_op(path, instr, input_mode, ops)
+                        stack, new_locals = _apply_poly_op(path, instr, input_mode, ops)
                     except SymbolicStackUnderflow:
                         underflow_seen = True
                         # drop this path; don't propagate partial result
@@ -330,12 +332,15 @@ def run_forking(prog: List[isa.Instruction], *,
                         # Variable id = PUSH's pc (stable across forked paths).
                         new_bindings = dict(path.bindings)
                         new_bindings[path.pc] = int(instr.arg)
-                    path = path.with_(
+                    with_kwargs = dict(
                         pc=path.pc + 1,
                         stack=stack,
                         n_heads=path.n_heads + (0 if op == isa.OP_NOP else 1),
                         bindings=new_bindings,
                     )
+                    if new_locals is not None:
+                        with_kwargs["locals_"] = new_locals
+                    path = path.with_(**with_kwargs)
                     continue
 
                 # JZ / JNZ: pop cond, decide branch.
@@ -519,8 +524,16 @@ def run_forking(prog: List[isa.Instruction], *,
 
 def _apply_poly_op(path: _Path, instr: isa.Instruction,
                    input_mode: str,
-                   arithmetic_ops: ArithmeticOps = DEFAULT_ARITHMETIC_OPS) -> Tuple[RationalStackValue, ...]:
+                   arithmetic_ops: ArithmeticOps = DEFAULT_ARITHMETIC_OPS
+                   ) -> Tuple[Tuple[RationalStackValue, ...],
+                              Optional[Dict[int, RationalStackValue]]]:
     """Apply a non-branch opcode to ``path.stack`` and return the new stack.
+
+    Returns ``(new_stack, new_locals_or_None)``. ``new_locals`` is
+    non-``None`` only when the op mutated the locals store (LOCAL_SET /
+    LOCAL_TEE, issue #102 ops); callers should fold it into the path
+    via :meth:`_Path.with_`. A ``None`` lets non-LOCAL ops stay
+    allocation-free.
 
     ``arithmetic_ops`` picks the ADD/SUB/MUL/DIV_S/REM_S implementations.
     Defaults to Poly's native operators (plus RationalPoly/SymbolicRemainder
@@ -703,10 +716,32 @@ def _apply_poly_op(path: _Path, instr: isa.Instruction,
         stack.append(bit_fn(a))
     elif op == isa.OP_NOP:
         pass
+    elif op == isa.OP_LOCAL_GET:
+        # Slot read — polynomial-closed by construction (issues #100, #102).
+        # Uninitialized slot is a hard error (matches run_symbolic).
+        if instr.arg not in path.locals_:
+            raise SymbolicStackUnderflow(
+                f"LOCAL_GET of uninitialized slot {instr.arg}"
+            )
+        stack.append(path.locals_[instr.arg])
+    elif op == isa.OP_LOCAL_SET:
+        # Pops top → writes to slot. Caller must fold new_locals into path.
+        if not stack:
+            raise SymbolicStackUnderflow("LOCAL_SET on empty stack")
+        new_locals = dict(path.locals_)
+        new_locals[instr.arg] = _pop()
+        return tuple(stack), new_locals
+    elif op == isa.OP_LOCAL_TEE:
+        # Peeks top (leaves it on stack) → writes to slot.
+        if not stack:
+            raise SymbolicStackUnderflow("LOCAL_TEE on empty stack")
+        new_locals = dict(path.locals_)
+        new_locals[instr.arg] = stack[-1]
+        return tuple(stack), new_locals
     else:  # pragma: no cover
         raise SymbolicOpNotSupported(f"op {op} unexpected in _apply_poly_op")
 
-    return tuple(stack)
+    return tuple(stack), None
 
 
 def _build_guarded_poly(
@@ -817,19 +852,22 @@ def _run_prefix(prog: List[isa.Instruction], end_pc: int,
             return None
         if op not in (isa.OP_JZ, isa.OP_JNZ):
             try:
-                stack = _apply_poly_op(path, instr, input_mode, ops)
+                stack, new_locals = _apply_poly_op(path, instr, input_mode, ops)
             except (SymbolicStackUnderflow, SymbolicOpNotSupported):
                 return None
             new_bindings = path.bindings
             if op == isa.OP_PUSH and input_mode == "symbolic":
                 new_bindings = dict(path.bindings)
                 new_bindings[path.pc] = int(instr.arg)
-            path = path.with_(
+            with_kwargs = dict(
                 pc=path.pc + 1,
                 stack=stack,
                 bindings=new_bindings,
                 n_heads=path.n_heads + (0 if op == isa.OP_NOP else 1),
             )
+            if new_locals is not None:
+                with_kwargs["locals_"] = new_locals
+            path = path.with_(**with_kwargs)
             continue
         # JZ / JNZ: only concrete conds are OK in a prefix.
         if not path.stack:
@@ -937,19 +975,22 @@ def _run_body_iteration(
             return None
         if op not in (isa.OP_JZ, isa.OP_JNZ):
             try:
-                stack = _apply_poly_op(path, instr, input_mode, ops)
+                stack, new_locals = _apply_poly_op(path, instr, input_mode, ops)
             except (SymbolicStackUnderflow, SymbolicOpNotSupported):
                 return None
             new_bindings = path.bindings
             if op == isa.OP_PUSH and input_mode == "symbolic":
                 new_bindings = dict(path.bindings)
                 new_bindings[path.pc] = int(instr.arg)
-            path = path.with_(
+            with_kwargs = dict(
                 pc=path.pc + 1,
                 stack=stack,
                 bindings=new_bindings,
                 n_heads=path.n_heads + (0 if op == isa.OP_NOP else 1),
             )
+            if new_locals is not None:
+                with_kwargs["locals_"] = new_locals
+            path = path.with_(**with_kwargs)
             continue
         # JZ/JNZ inside the body (pc < back_edge_pc): must be the
         # exit test. Always take the "stay in loop" branch.

@@ -118,6 +118,10 @@ _POLY_OPS = {
     isa.OP_AND, isa.OP_OR, isa.OP_XOR,
     isa.OP_SHL, isa.OP_SHR_S, isa.OP_SHR_U,
     isa.OP_CLZ, isa.OP_CTZ, isa.OP_POPCNT,
+    # Local-variable slots (issues #100 / #102) — polynomial-closed by
+    # construction, needed by poly_to_program-generated rows (issue #96).
+    # Kept in sync with symbolic_executor._POLY_OPS.
+    isa.OP_LOCAL_GET, isa.OP_LOCAL_SET, isa.OP_LOCAL_TEE,
 }
 # Control flow — handled by the forking executor (issue #70).
 _BRANCH_OPS = {isa.OP_JZ, isa.OP_JNZ}
