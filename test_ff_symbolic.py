@@ -967,6 +967,52 @@ def test_equivalence_is_power_of_2_structural():
     _check("is_power_of_2.struct.rel", sym.top.relation == fs.top.relation)
 
 
+def test_forward_symbolic_bitvec_numeric():
+    """Issue #108 guardrail. Uses ``CompiledModel.forward_symbolic`` as the
+    *driver under test* (not ``run_symbolic``) and cross-checks against
+    ``NumPyExecutor`` — the original ``test_equivalence_bitvec_numeric``
+    below reads ``run_symbolic`` for its ``sym_val``, so a silently wrong
+    ``forward_symbolic`` result (like the SHL ``3 << 2 = 16`` bug that
+    sat on main from M3 until #108) was invisible to the numeric family.
+
+    Non-commutative ops (SHL / SHR_S / SHR_U) and the hybrid-BitVec SUB
+    path are the load-bearing cases — they'd regress silently without a
+    forward_symbolic-driven numeric cross-check.
+    """
+    import programs as P
+    model = CompiledModel()
+    np_exec = NumPyExecutor()
+
+    cases = [
+        ("bitwise_and(12,10)",  P.make_bitwise_binary(isa.OP_AND, 12, 10)),
+        ("bitwise_or(12,10)",   P.make_bitwise_binary(isa.OP_OR, 12, 10)),
+        ("bitwise_xor(12,10)",  P.make_bitwise_binary(isa.OP_XOR, 12, 10)),
+        ("bitwise_shl(3,2)",    P.make_bitwise_binary(isa.OP_SHL, 3, 2)),
+        ("bitwise_shr_s(-4,1)", P.make_bitwise_binary(isa.OP_SHR_S, -4, 1)),
+        ("bitwise_shr_u(-1,4)", P.make_bitwise_binary(isa.OP_SHR_U, -1, 4)),
+        ("native_clz(16)",      P.make_native_clz(16)),
+        ("native_ctz(8)",       P.make_native_ctz(8)),
+        ("native_popcnt(13)",   P.make_native_popcnt(13)),
+        ("bit_extract(5,0)",    P.make_bit_extract(5, 0)),
+        ("log2_floor(8)",       P.make_log2_floor(8)),
+        ("is_power_of_2(8)",    P.make_is_power_of_2(8)),
+    ]
+    for name, (prog, _expected) in cases:
+        try:
+            fs = model.forward_symbolic(prog)
+            ff_val = fs.top.eval_at(fs.bindings)
+        except Exception as e:  # pragma: no cover
+            _fail(f"ff.bitvec.numeric[{name}]",
+                  f"forward_symbolic.eval_at raised: {type(e).__name__}: {e}")
+            continue
+        np_top = np_exec.execute(prog).steps[-1].top
+        _check(
+            f"ff.bitvec.numeric[{name}]",
+            ff_val == np_top,
+            f"forward_symbolic={ff_val}  NumPyExecutor={np_top}",
+        )
+
+
 def test_equivalence_bitvec_numeric():
     """Three-way check: ``sym.top.eval_at == NumPy top == TorchExecutor top``
     for every bit-vector row. Ensures M_BITBIN / M_BITUN realise the same
@@ -1423,6 +1469,7 @@ def main():
         test_equivalence_bitvec_nested_structural,
         test_equivalence_is_power_of_2_structural,
         test_equivalence_bitvec_numeric,
+        test_forward_symbolic_bitvec_numeric,
         test_bitvec_parameter_count,
         test_modpoly_primitives,
         test_symbolic_primitives_mod,
