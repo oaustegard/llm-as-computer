@@ -521,6 +521,114 @@ def test_known_eml_shapes_match_paper():
     assert tree_depth(add_tree) == 6
 
 
+
+# ─── Generated catalog entries (issue #96) ────────────────────────
+
+def test_generated_entries_present_in_default_catalog():
+    """At least 6 generated entries appear in the default catalog."""
+    rows = run_catalog()
+    gen_rows = [r for r in rows if r.name.startswith("gen_")]
+    assert len(gen_rows) >= 5, f"expected ≥5 generated rows, got {len(gen_rows)}"
+
+
+def test_generated_entries_all_collapsed():
+    """Every generated entry classifies as STATUS_COLLAPSED."""
+    rows = run_catalog()
+    gen_rows = [r for r in rows if r.name.startswith("gen_")]
+    assert gen_rows, "no generated rows found — catalog not extended"
+    non_collapsed = [r for r in gen_rows if r.status != STATUS_COLLAPSED]
+    assert not non_collapsed, (
+        "generated rows not STATUS_COLLAPSED: "
+        + ", ".join(f"{r.name}={r.status}" for r in non_collapsed)
+    )
+
+
+def test_generated_entries_numeric_match():
+    """Every generated entry has numeric_match=True (NumPy ≡ Poly at the
+    PUSH-0 binding point)."""
+    rows = run_catalog()
+    gen_rows = [r for r in rows if r.name.startswith("gen_")]
+    failures = [r for r in gen_rows if r.numeric_match is not True]
+    assert not failures, (
+        "numeric_match failed: "
+        + ", ".join(f"{r.name}={r.numeric_match}" for r in failures)
+    )
+
+
+def test_generated_entry_shapes():
+    """Pin polynomial shape and monomial count for selected generated entries."""
+    rows = {r.name: r for r in run_catalog()}
+
+    # x0^5 — 1 monomial, degree 5
+    r = rows["gen_x0_fifth"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 1
+    assert r.poly_expr == "x0^5"
+    assert r.numeric_match is True
+
+    # 10*x0 — 1 monomial, large coefficient
+    r = rows["gen_10x0"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 1
+    assert r.poly_expr == "10*x0"
+    assert r.numeric_match is True
+
+    # x0^2 + x0*x1 + x1^2 + x0 + x1 — exactly 5 monomials
+    r = rows["gen_sum_of_five_terms"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 5
+    assert r.numeric_match is True
+
+    # 3*x0*x1 - 2*x0^2 + x1 — exactly 3 monomials (mixed signs)
+    r = rows["gen_mixed_signs"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 3
+    assert r.numeric_match is True
+
+    # x0*x1*x2*x3 — 1 monomial, 4 variables
+    r = rows["gen_x0x1x2x3"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 1
+    assert r.numeric_match is True
+
+    # x0*x1 + x2*x3 — 2 monomials, 4 variables
+    r = rows["gen_x0x1_plus_x2x3"]
+    assert r.status == STATUS_COLLAPSED
+    assert r.n_monomials == 2
+    assert r.numeric_match is True
+
+
+def test_generated_entries_eml_when_available():
+    """When eml-sr is present, generated collapsed entries get EML tree metrics."""
+    if not _EML_AVAILABLE:
+        print("  (eml-sr not available — skipping generated eml test)")
+        return
+    rows = run_catalog()
+    gen_rows = [r for r in rows if r.name.startswith("gen_") and r.status == STATUS_COLLAPSED]
+    assert gen_rows
+    for r in gen_rows:
+        assert r.eml_size is not None and r.eml_size >= 1, r.name
+        assert r.eml_depth is not None and r.eml_depth >= 0, r.name
+
+
+def test_generated_catalog_standalone():
+    """_generated_catalog() can be run in isolation and produces exactly 6 entries."""
+    from symbolic_programs_catalog import _generated_catalog
+    entries = _generated_catalog()
+    assert len(entries) == 6
+    names = {e.name for e in entries}
+    expected_names = {
+        "gen_x0_fifth",
+        "gen_x0x1x2x3",
+        "gen_sum_of_five_terms",
+        "gen_mixed_signs",
+        "gen_10x0",
+        "gen_x0x1_plus_x2x3",
+    }
+    assert names == expected_names, f"unexpected names: {names ^ expected_names}"
+
+
+
 # ─── Runner ───────────────────────────────────────────────────────
 
 def _collect_tests():
