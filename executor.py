@@ -454,6 +454,73 @@ class NumPyExecutor:
 
 # ─── Compiled PyTorch Model ──────────────────────────────────────
 
+# Specialization residual dims, appended after the base D_MODEL=51 layout
+# (see isa.py). Only present when the model is built with specialized=sp.
+DIM_FETCHED_OP  = D_MODEL          # 51
+DIM_FETCHED_ARG = D_MODEL + 1      # 52
+D_MODEL_SPECIALIZED = D_MODEL + 2  # 53
+
+
+class SpecializationFFN(nn.Module):
+    """2N step-function ReGLU neurons that materialize a SpecializedProgram.
+
+    Realises  fetched_f(ip) = sum_{i=0..N-1} coef_f[i] * 1[ip >= i]
+    using two ReLU half-neurons per instruction whose difference is the
+    integer-valued indicator:
+
+        A_i = ReLU(ip - i + 1)     (gate row 2i)
+        B_i = ReLU(ip - i)         (up   row 2i+1)
+        A_i - B_i = 1[ip >= i]     for any integer ip >= 0
+
+    W_down accumulates  sum_i coef_f[i] * (A_i - B_i)  into the two
+    fetched residual dims (DIM_FETCHED_OP, DIM_FETCHED_ARG). Coefficients
+    are taken directly from sp.coefficients['op'] and sp.coefficients['arg']
+    -- which already store the telescoping deltas
+    [c0, c1-c0, c2-c1, ...] -- so the sum reconstructs c_ip exactly.
+    """
+
+    def __init__(self, sp, d_model):
+        super().__init__()
+        self.n = sp.n
+        self.d_model = d_model
+        # 2N hidden ReLU neurons, then a 2-row down-projection into
+        # (DIM_FETCHED_OP, DIM_FETCHED_ARG).
+        self.W_in = nn.Linear(d_model, 2 * sp.n, bias=True)
+        self.W_down = nn.Linear(2 * sp.n, 2, bias=False)
+        self.double()
+        self._compile(sp)
+
+    def _compile(self, sp):
+        with torch.no_grad():
+            W_in = torch.zeros(2 * sp.n, self.d_model, dtype=DTYPE)
+            b_in = torch.zeros(2 * sp.n, dtype=DTYPE)
+            for i in range(sp.n):
+                # gate row 2i: ReLU(ip + 1 - i)
+                W_in[2 * i, DIM_IP] = 1.0
+                b_in[2 * i] = 1.0 - float(i)
+                # up row 2i + 1: ReLU(ip - i)
+                W_in[2 * i + 1, DIM_IP] = 1.0
+                b_in[2 * i + 1] = -float(i)
+            self.W_in.weight.copy_(W_in)
+            self.W_in.bias.copy_(b_in)
+
+            W_down = torch.zeros(2, 2 * sp.n, dtype=DTYPE)
+            for i in range(sp.n):
+                c_op = float(sp.coefficients["op"][i])
+                c_arg = float(sp.coefficients["arg"][i])
+                W_down[0, 2 * i]     = c_op    # +c_op * A_i
+                W_down[0, 2 * i + 1] = -c_op   # -c_op * B_i
+                W_down[1, 2 * i]     = c_arg
+                W_down[1, 2 * i + 1] = -c_arg
+            self.W_down.weight.copy_(W_down)
+
+    def forward(self, query_emb):
+        """Return (fetched_op_scalar, fetched_arg_scalar) at this query's ip."""
+        h = torch.relu(self.W_in(query_emb))
+        out = self.W_down(h)
+        return out[0], out[1]
+
+
 class CompiledModel(nn.Module):
     """Compiled transformer with 10 attention heads and linear+nonlinear FF dispatch.
 
@@ -476,9 +543,25 @@ class CompiledModel(nn.Module):
       sp_deltas: per-opcode stack pointer delta
     """
 
-    def __init__(self, d_model=D_MODEL):
+    def __init__(self, d_model=D_MODEL, specialized=None):
         nn.Module.__init__(self)
+        # Specialized models append two residual dims (DIM_FETCHED_OP /
+        # DIM_FETCHED_ARG) so the fetched opcode/arg can be read out of
+        # the residual instead of out of attention over a program prefix.
+        if specialized is not None:
+            assert d_model == D_MODEL, (
+                "specialized=sp expects the default d_model; "
+                "the +2 grow is handled internally."
+            )
+            d_model = D_MODEL_SPECIALIZED
         self.d_model = d_model
+        self.specialized = specialized
+        # d_ffn: number of hidden FF neurons. The base dispatch uses none
+        # (M_top is a direct linear routing). Specialization adds exactly
+        # 2N step-function neurons.
+        self.d_ffn = (2 * specialized.n) if specialized is not None else 0
+        if specialized is not None:
+            assert self.d_model == D_MODEL + 2, "d_model must grow by exactly 2 when specialized"
 
         # Heads 0-4
         self.head_prog_op  = CompiledAttentionHead(d_model, head_dim=2, v_dim=1)
@@ -500,6 +583,14 @@ class CompiledModel(nn.Module):
         self.register_buffer('sp_deltas', torch.zeros(N_OPCODES, dtype=DTYPE))
 
         self._compile_weights()
+
+        # Built last so it sees the final self.d_model. Kept isolated from
+        # _compile_weights to avoid touching the existing 200+ line
+        # head/dispatch compilation -- extend, don't refactor.
+        if specialized is not None:
+            self.specialization_ffn = SpecializationFFN(specialized, self.d_model)
+        else:
+            self.specialization_ffn = None
 
     def _compile_weights(self):
         """Set all weight matrices analytically."""
@@ -731,10 +822,18 @@ class CompiledModel(nn.Module):
         if call_embs is None:
             call_embs = torch.zeros(0, self.d_model, dtype=DTYPE)
 
-        # Head 0: Fetch opcode
-        opcode_val, _, _ = self.head_prog_op(query_emb, prog_embs)
-        # Head 1: Fetch argument
-        arg_val, _, _ = self.head_prog_arg(query_emb, prog_embs)
+        if self.specialized is not None:
+            # Specialized mode: fetched opcode/arg come out of the
+            # 2N step-function FFN, not from attention over prog_embs.
+            # prog_embs may be None or empty here.
+            op_scalar, arg_scalar = self.specialization_ffn(query_emb)
+            opcode_val = op_scalar.unsqueeze(0)
+            arg_val = arg_scalar.unsqueeze(0)
+        else:
+            # Head 0: Fetch opcode
+            opcode_val, _, _ = self.head_prog_op(query_emb, prog_embs)
+            # Head 1: Fetch argument
+            arg_val, _, _ = self.head_prog_arg(query_emb, prog_embs)
 
         # Head 2: Read stack[SP]
         if stack_embs.shape[0] > 0:
@@ -823,8 +922,13 @@ class CompiledModel(nn.Module):
         # scalar back. The & MASK32 step lives here, outside the form,
         # for i32-wrap parity with NumPyExecutor — the form itself
         # computes over Z (see ff_symbolic.range_check / equivalence proof).
-        ea = ff_symbolic.E(va, self.d_model)
-        eb = ff_symbolic.E(vb, self.d_model)
+        # ff_symbolic's M_ADD/M_SUB/B_MUL are sized at D_MODEL=51 at module
+        # load (see ff_symbolic._M_ADD_matrix). The scalar va/vb path here
+        # is independent of the residual width, so always lift through the
+        # base D_MODEL embedding regardless of self.d_model (which can be
+        # D_MODEL+2 in specialized mode).
+        ea = ff_symbolic.E(va, D_MODEL)
+        eb = ff_symbolic.E(vb, D_MODEL)
         nonlinear[OPCODE_IDX[OP_ADD]] = float(ff_symbolic.E_inv(
             ff_symbolic.forward_add(ea, eb)) & MASK32)
         nonlinear[OPCODE_IDX[OP_SUB]] = float(ff_symbolic.E_inv(
@@ -946,13 +1050,40 @@ class TorchExecutor:
         self.model = model or CompiledModel()
         self.model.eval()
 
-    def execute(self, prog, max_steps=50000):
-        trace = Trace(program=prog)
+    def execute(self, prog=None, max_steps=50000):
+        # Specialized mode: prog can be None, in which case the trace's
+        # display program is reconstructed from sp.originals.
+        is_specialized = self.model.specialized is not None
+        if is_specialized:
+            spec = self.model.specialized
+            if prog is None:
+                prog = list(spec.originals)
+            n_prog = spec.n
+            prog_embs = None
+        else:
+            n_prog = len(prog)
+            prog_embs = torch.stack([
+                embed_program_token(i, instr)
+                for i, instr in enumerate(prog)
+            ])
 
-        prog_embs = torch.stack([
-            embed_program_token(i, instr)
-            for i, instr in enumerate(prog)
-        ])
+        trace = Trace(program=prog)
+        d_model = self.model.d_model
+
+        def _pad(emb):
+            """Pad a D_MODEL-shaped (1-D or 2-D) tensor to the model's d_model.
+
+            Memory entries are produced by embed_*_entry helpers in the
+            base D_MODEL=51 layout. When the model is specialized, the
+            attention heads expect d_model=53 inputs; the extra dims
+            (DIM_FETCHED_OP / DIM_FETCHED_ARG) are unused for keys/values
+            and so safe to fill with zeros.
+            """
+            if emb.shape[-1] == d_model:
+                return emb
+            pad_shape = list(emb.shape)
+            pad_shape[-1] = d_model - emb.shape[-1]
+            return torch.cat([emb, torch.zeros(*pad_shape, dtype=emb.dtype)], dim=-1)
 
         stack_embs_list = []
         local_embs_list = []
@@ -969,22 +1100,22 @@ class TorchExecutor:
 
         with torch.no_grad():
             for step in range(max_steps):
-                if ip >= len(prog):
+                if ip >= n_prog:
                     break
 
-                query = embed_state(ip, sp)
-                stack_embs = (torch.stack(stack_embs_list)
+                query = _pad(embed_state(ip, sp))
+                stack_embs = (_pad(torch.stack(stack_embs_list))
                               if stack_embs_list
-                              else torch.zeros(0, D_MODEL, dtype=DTYPE))
-                local_embs = (torch.stack(local_embs_list)
+                              else torch.zeros(0, d_model, dtype=DTYPE))
+                local_embs = (_pad(torch.stack(local_embs_list))
                               if local_embs_list
-                              else torch.zeros(0, D_MODEL, dtype=DTYPE))
-                heap_embs = (torch.stack(heap_embs_list)
+                              else torch.zeros(0, d_model, dtype=DTYPE))
+                heap_embs = (_pad(torch.stack(heap_embs_list))
                              if heap_embs_list
-                             else torch.zeros(0, D_MODEL, dtype=DTYPE))
-                call_embs = (torch.stack(call_embs_list)
+                             else torch.zeros(0, d_model, dtype=DTYPE))
+                call_embs = (_pad(torch.stack(call_embs_list))
                              if call_embs_list
-                             else torch.zeros(0, D_MODEL, dtype=DTYPE))
+                             else torch.zeros(0, d_model, dtype=DTYPE))
 
                 opcode, arg, sp_delta, top, _, val_a, val_b, val_c, local_val, heap_val = \
                     self.model.forward(query, prog_embs, stack_embs, local_embs, heap_embs,

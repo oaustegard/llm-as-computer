@@ -151,3 +151,23 @@ def verify_fetch_parity(prog: List[Instruction]) -> bool:
                 f"specialized={sp.fetch(i)} direct={direct(i)}"
             )
     return True
+
+
+def build_specialized_model(prog, base=None):
+    """Materialize ``prog`` as a specialized ``CompiledModel``.
+
+    Convenience wrapper: specialize the program, then construct a
+    ``CompiledModel(specialized=sp)`` whose FFN holds the 2N step-function
+    neurons. The result has no dependency on a program prefix at runtime --
+    its ``forward`` reads opcode/arg out of two new residual dims.
+
+    Imported lazily so ``specialize`` can be used without pulling torch.
+    """
+    # Unpack (prog, expected) tuples returned by programs.make_*
+    if isinstance(prog, tuple) and len(prog) == 2 and isinstance(prog[0], list):
+        prog = prog[0]
+
+    from executor import CompiledModel  # local import: avoid torch dep at module load
+
+    sp = specialize(prog)
+    return CompiledModel(specialized=sp)
