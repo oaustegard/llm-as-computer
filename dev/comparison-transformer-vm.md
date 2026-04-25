@@ -232,6 +232,158 @@ artifact to point at. If the goal is "understand why and where this
 breaks down vs. when compiled," LAC is the better-documented
 journey.
 
+## 11. Honest reckoning — the symbolic stack
+
+Section 10 frames LAC's "symbolic-equivalence analysis of the compiled
+FF" as one of two clear wins over TVM. After actually reading the
+~6,600 lines that make up the symbolic stack
+(`symbolic_executor.py`, `forking_executor.py`, `ff_symbolic.py`,
+`closed_form.py`, `algebraic_poly.py`, `modpoly.py`, `poly.py`,
+`poly_compiler.py`, `symbolic_programs_catalog.py`, `path_b.py`,
+`guarded.py`, `symbolic_types.py`, `bitvec.py`, plus the recurrent
+and poly-embedding variants), that framing needs a softer
+qualification. The stack is good research output, but most of its
+"value-add over TVM" disappears once you look at TVM's graph DSL.
+
+### 11.1 What it really delivers
+
+Three things are load-bearing. Everything else is chrome.
+
+**(a) Closing the Python-arithmetic gap.** Before issue #69, the FF
+dispatch in `executor.CompiledModel.forward` had this fallback:
+
+```python
+nonlinear[OPCODE_IDX[OP_ADD]] = float((va + vb) & MASK32)
+nonlinear[OPCODE_IDX[OP_SUB]] = float((vb - va) & MASK32)
+nonlinear[OPCODE_IDX[OP_MUL]] = float((va * vb) & MASK32)
+```
+
+The transformer was *routing* arithmetic that CPython performed.
+`ff_symbolic.py` replaced that with `M_ADD`, `M_SUB`, `B_MUL` —
+analytically-set linear and bilinear forms — and proved (by
+construction plus catalog cross-check) that the same operator tree,
+re-interpreted over `Poly` instead of `torch.Tensor`, yields the
+polynomial that `run_symbolic` emits. Without `ff_symbolic`, the
+compile claim has a Python-shaped hole. **This is the one piece that
+genuinely earns the "weights ARE the polynomial" slogan.**
+
+**(b) A regression suite with canonical normal forms.** The catalog
+runner classifies 43 programs into collapsed (28) / guarded (4) /
+unrolled (5) / closed-form (4) / blocked (2) and prints the canonical
+`Poly` / `GuardedPoly` / `ClosedForm` / `ProductForm` for each. If
+you change FF dispatch, embedding scheme, or add an opcode, the
+catalog flags movement at the *semantic* level, not just the trace
+level. This is the most practically useful piece day-to-day.
+
+**(c) A real closed-form loop solver.** `forking_executor` walks a
+symbolic loop body, classifies the recurrence (affine → Faulhaber
+polynomial inside `Poly`; constant-integer matrix → `ClosedForm`;
+multiplicative over a Poly factor → `ProductForm`), and emits a top
+that evaluates without unrolling. `fibonacci_sym(n)`,
+`power_of_2_sym(n)`, `factorial_sym(n)`, `sum_1_to_n_sym(n)` all
+collapse this way. This is genuine algorithmic content — actual
+computer-algebra plumbing, not just bookkeeping.
+
+### 11.2 What it doesn't deliver, and the chrome
+
+- It doesn't make execution faster. `eval_at` walks the loop in
+  Python; matrix-power squaring isn't even used because the catalog
+  caps trip counts at n ≤ 32.
+- It doesn't extend the ISA. It runs *parallel* to `executor.py`,
+  not as an enabler.
+- It doesn't generate weights — it *characterises* them.
+- It doesn't help training (training was abandoned for compile).
+
+The chrome:
+
+- `poly_compiler.poly_to_program` (Poly → branchless LAC program with
+  round-trip `run_symbolic(poly_to_program(p)).top == p`) is a
+  curiosity. The catalog already tells you which polynomials map to
+  which programs.
+- `algebraic_poly` (Path B.3, Binet's formula via ℚ(√5)) deliberately
+  reopens a "no" decision from #89 to get a single-layer Fibonacci
+  realisation. Cute but narrow — Fibonacci only.
+- `bitvec`, `modpoly`, `RationalPoly`, `IndicatorPoly` extend the
+  type ring to bitwise / mod / division / comparison opcodes, but
+  composition past one such op raises `BlockedOpcodeForSymbolic`.
+  The symbolic ring closes one layer thick, not arbitrarily.
+- `ff_symbolic_recurrent.py`, `ff_symbolic_poly_embedding.py`,
+  `path_b.py` are exploratory sub-paths.
+
+The honest characterisation: this is a *verification and
+characterisation* layer, not an *enablement* layer.
+
+### 11.3 Would it port to transformer-vm?
+
+Mostly no, with one piece worth lifting — and not from LAC.
+
+**TVM already has the formal spec for free.** LAC needed
+`ff_symbolic` because `CompiledModel.forward` had a Python-arithmetic
+fallback. TVM has no such fallback. `transformer_vm/graph/core.py`
+*is* a symbolic algebra DSL — `Expression`, `ReGLUDimension`,
+`LookUpDimension`, `PersistDimension`, `CumSumDimension` —
+and `transformer_vm/model/weights.py` analytically materialises
+tensors from that graph. The "weights ARE the spec" property is
+*structural* in TVM, not a side proof. There is no
+Python-arithmetic hole to plug.
+
+**Granularity mismatch breaks the polynomial framing.** LAC operates
+at i32-value granularity, so `PUSH 3 ; PUSH 5 ; ADD ; HALT` cleanly
+becomes `x0 + x1`. TVM tokenises one token per *byte*, with explicit
+carry propagation (`carry` is a top-level `InputDimension`, see
+`transformer_vm/wasm/interpreter.py:223`). A 32-bit add is a
+sequence of byte tokens with carries chained between them. Recovering
+a value-level polynomial in TVM means either (a) re-deriving it from
+the *original* WASM (in which case you've reimplemented Binaryen /
+wasm-opt / Souper), or (b) writing a substantial abstraction layer
+over `graph/core.py` to lift byte semantics back to value semantics.
+Neither is small.
+
+**TVM's lowered ISA loses the polynomial-closed core.** TVM's
+`compilation/lower.py` rewrites `MUL`, `DIV`, `MOD`, `AND`, `OR`,
+`XOR`, `SHL`, `SHR` into `ADD/SUB` sequences at compile time. The
+polynomial-closed core in LAC's catalog (which includes native `MUL`)
+doesn't translate at all. You'd be analysing a long-arithmetic
+unrolled trace, not a polynomial.
+
+**The one piece worth lifting, at the WASM level not the transformer
+level.** The recurrence-classifier-and-solver in `forking_executor`
+is the only piece of LAC's symbolic stack that does nontrivial
+*computation* rather than recording structure. If TVM wants to serve
+`factorial(20)` *without* 900 K tokens of autoregress, it should
+recognise the loop as a `ProductForm`, replace it with the constant
+`2432902008176640000`, and emit. But the right place for that is the
+*compilation pipeline* (`transformer_vm/compilation/`), operating on
+WASM IR before lowering — not on the transformer graph after weights
+are built. And it's a job for an existing optimiser pass (Souper,
+LLVM polly, Binaryen) more than a custom Python-and-Poly stack
+ported wholesale.
+
+### 11.4 Revised verdict
+
+Section 10 listed two things LAC does that TVM doesn't:
+"(a) high-throughput compiled execution (Mojo) and (b)
+symbolic-equivalence analysis of the compiled FF."
+
+(a) holds up. Mojo at 67–126 M steps/sec is a real, measurable win
+that TVM has no equivalent of.
+
+(b) needs revision. The symbolic-equivalence analysis was *necessary*
+for LAC because LAC had a Python-arithmetic gap to close. TVM didn't
+have that gap to begin with. Saying "LAC does this and TVM doesn't"
+is technically true but misleading — it's like noting that a guard
+dog has a job a guard rail doesn't, while ignoring that the guard
+rail makes the dog unnecessary. The catalog regression suite and the
+closed-form loop solver are useful research artefacts, but they're
+verification machinery, not capability extensions, and the closed-form
+solver is misplaced — it would do more good upstream of TVM, in
+standard WASM optimisation passes, than as a port.
+
+The corrected single-sentence summary: **the symbolic stack is good
+*for LAC* because it patches a real gap and gives a regression
+harness; it doesn't compose cleanly with TVM's architecture, and
+porting it would mostly reimplement structure TVM already has.**
+
 ---
 
 ## Appendix — file pointers
