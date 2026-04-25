@@ -24,7 +24,11 @@ from typing import List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from isa import Instruction
+from isa import (
+    Instruction,
+    OP_EQ, OP_LT_S,
+    OP_AND, OP_OR, OP_XOR, OP_SHL,
+)
 from executor import NumPyExecutor
 from programs import (
     ALL_TESTS,
@@ -36,6 +40,7 @@ from programs import (
 )
 from specialize import (
     SpecializedProgram, specialize, verify_fetch_parity, fetch_fn_from_program,
+    build_specialized_model,
 )
 
 
@@ -131,6 +136,73 @@ def _check(name: str, prog_or_test) -> None:
     )
 
 
+# ─── Torch parity: specialized CompiledModel matches universal ──────
+
+def _torch_parity(name: str, prog: List[Instruction], max_steps: int = 50000) -> int:
+    """Run the universal TorchExecutor against a specialized one and
+    assert step-by-step trace equality at TraceStep granularity.
+
+    Specialized executor:
+      - has no program prefix (prog_embs=None inside CompiledModel.forward)
+      - reads (op, arg) at each step from the 2N step-function FFN
+        whose output lives in residual dims DIM_FETCHED_OP /
+        DIM_FETCHED_ARG.
+
+    Acceptance for issue #115. Bit-exact trace parity is the strongest
+    available signal that the analytically constructed weights replay
+    the program correctly.
+    """
+    # Lazy: torch import only when this section runs.
+    from executor import TorchExecutor, CompiledModel, D_MODEL, D_MODEL_SPECIALIZED
+
+    universal_model = CompiledModel()
+    universal = TorchExecutor(universal_model).execute(prog, max_steps=max_steps)
+
+    spec_model = build_specialized_model(prog)
+
+    # Acceptance: shape sanity in the constructor.
+    assert spec_model.d_model == D_MODEL_SPECIALIZED == D_MODEL + 2, (
+        f"{name}: specialized d_model = {spec_model.d_model}, expected {D_MODEL + 2}"
+    )
+    assert spec_model.d_ffn == 2 * len(prog), (
+        f"{name}: specialized d_ffn = {spec_model.d_ffn}, expected {2 * len(prog)}"
+    )
+    assert spec_model.specialization_ffn is not None
+    # The base (non-specialized) model has no FFN.
+    assert universal_model.specialization_ffn is None
+    assert universal_model.d_model == D_MODEL
+    assert universal_model.d_ffn == 0
+
+    # prog_embs=None should be tolerated by the model in specialized mode.
+    specialized = TorchExecutor(spec_model).execute(prog, max_steps=max_steps)
+
+    # Also run with prog=None to confirm the executor can recover the
+    # display program from sp.originals.
+    specialized_no_prog = TorchExecutor(spec_model).execute(None, max_steps=max_steps)
+
+    u = _trace_tuples(universal)
+    s = _trace_tuples(specialized)
+    s2 = _trace_tuples(specialized_no_prog)
+    assert len(u) == len(s) == len(s2), (
+        f"{name}: step counts: universal={len(u)} specialized={len(s)} "
+        f"specialized(no prog)={len(s2)}"
+    )
+    for i, (a, b) in enumerate(zip(u, s)):
+        assert a == b, f"{name}: trace divergence at step {i}: universal={a} specialized={b}"
+    for i, (a, b) in enumerate(zip(u, s2)):
+        assert a == b, (
+            f"{name}: trace divergence (no-prog mode) at step {i}: "
+            f"universal={a} specialized={b}"
+        )
+    return len(u)
+
+
+def _torch_check(name: str, prog_or_test) -> None:
+    prog = _unpack(prog_or_test() if callable(prog_or_test) else prog_or_test)
+    steps = _torch_parity(name, prog)
+    print(f"  {name:34s}  N={len(prog):3d}  steps={steps:5d}  torch-parity OK")
+
+
 def main() -> int:
     print("=" * 72)
     print("Specialization parity: static fetch + execution equivalence (42-op ISA)")
@@ -153,11 +225,22 @@ def main() -> int:
     _check("gcd(48, 18)",         make_gcd(48, 18))
     _check("is_even(14)",         make_is_even(14))
     _check("log2_floor(1024)",    make_log2_floor(1024))
-    _check("compare_binary eq",   make_compare_binary("eq", 3, 3))
-    _check("compare_binary lt_s", make_compare_binary("lt_s", -1, 1))
-    _check("bitwise_binary xor",  make_bitwise_binary("xor", 0xF0F0, 0x0FF0))
-    _check("bitwise_binary shl",  make_bitwise_binary("shl", 1, 5))
+    _check("compare_binary eq",   make_compare_binary(OP_EQ, 3, 3))
+    _check("compare_binary lt_s", make_compare_binary(OP_LT_S, -1, 1))
+    _check("bitwise_binary xor",  make_bitwise_binary(OP_XOR, 0xF0F0, 0x0FF0))
+    _check("bitwise_binary shl",  make_bitwise_binary(OP_SHL, 1, 5))
     _check("select_max(5, 9)",    make_select_max(5, 9))
+
+    print("\n── torch_parity (issue #115: specialized CompiledModel) ──")
+    # Issue #115 acceptance set: countdown(5/20), fibonacci(10),
+    # factorial(5), sum_1_to_n(10), plus the Phase 4 baseline.
+    _torch_check("countdown(5)",       make_countdown(5))
+    _torch_check("countdown(20)",      make_countdown(20))
+    _torch_check("fibonacci(10)",      make_fibonacci(10))
+    _torch_check("factorial(5)",       make_factorial(5))
+    _torch_check("sum_1_to_n(10)",     make_sum_1_to_n(10))
+    for tname, tfn in ALL_TESTS:
+        _torch_check(f"all_tests/{tname}", tfn)
 
     print("\n" + "=" * 72)
     print("OK — all specialization parity tests passed.")
