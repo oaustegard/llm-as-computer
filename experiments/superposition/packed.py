@@ -148,9 +148,9 @@ def embed_prog(U, pos, opname, arg):
                  **{f'op_{opname}': 1.0})
 
 
-def embed_stack(U, addr, value, wo):
+def embed_stack(U, addr, value, wo, eps=EPS):
     return embed(U, is_stack=1.0, stack_k0=2.0 * addr,
-                 stack_k1=-float(addr * addr) + EPS * wo, value=float(value), one=1.0)
+                 stack_k1=-float(addr * addr) + eps * wo, value=float(value), one=1.0)
 
 
 def embed_state(U, ip, sp):
@@ -166,7 +166,8 @@ def attend(W, q_emb, mem):
     return float((W['W_V'] @ mem[i])[0]), i
 
 
-def run(prog, U, R, H, max_steps=4000, capture=None, trace=None, quantize=True):
+def run(prog, U, R, H, max_steps=4000, capture=None, trace=None, quantize=True,
+        overwrite=False):
     """Execute a program in the packed basis.
 
     quantize: re-digitize every scalar read out of the residual stream (opcode,
@@ -182,6 +183,10 @@ def run(prog, U, R, H, max_steps=4000, capture=None, trace=None, quantize=True):
     Returns (result, steps) or (None, steps) if it never halts.
     """
     dig = (lambda x: float(round(x))) if quantize else (lambda x: x)
+    # overwrite: keep one row per address, so every score gap is >= 1 and the machine
+    # never leans on the 1e-6 write-order tiebreak. PREDICTIONS.md registered this as
+    # the fallback if the tiebreak turned out to be the binding constraint.
+    eps = 0.0 if overwrite else EPS
     r_k0 = R[F['stack_k0']]
     prog_embs = np.stack([embed_prog(U, p, o, a) for p, (o, a) in enumerate(prog)])
     stack_rows, addrs, sym_rows, wo, sp, ip = [], [], [], 0, 0, 0
@@ -216,11 +221,17 @@ def run(prog, U, R, H, max_steps=4000, capture=None, trace=None, quantize=True):
         new_sp = sp + sp_delta[r]
         for c in range(int(n_write[r])):
             val = float(W_write[r, c] @ u)
-            stack_rows.append(embed_stack(U, int(new_sp) - c, val, wo))
-            addrs.append(int(new_sp) - c)
-            sym_rows.append((int(new_sp) - c, val, wo))
+            a = int(new_sp) - c
+            row = embed_stack(U, a, val, wo, eps=eps)
+            if overwrite and a in addrs:
+                i = addrs.index(a)
+                stack_rows[i], sym_rows[i] = row, (a, val, wo)
+            else:
+                stack_rows.append(row)
+                addrs.append(a)
+                sym_rows.append((a, val, wo))
             if trace is not None:
-                rec.setdefault('wrote', []).append((int(new_sp) - c, val, wo))
+                rec.setdefault('wrote', []).append((a, val, wo))
             wo += 1
         jz, jnz, halt = ctrl[r]
         if halt:

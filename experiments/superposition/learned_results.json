@@ -1,0 +1,803 @@
+{
+ "meta": {
+  "overwrite": true,
+  "n_features": 24,
+  "margin": 0.5,
+  "tol": 0.25
+ },
+ "rows": [
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 11.154648594983431,
+   "dense_norm_median": 0.8485739192715706,
+   "indicator_norm_max": 24.99710853465141,
+   "d": 4,
+   "loss_margin": 0.2731673320533375,
+   "loss_tol": 0.0007906947845794476,
+   "viol": 0.30367475764635155
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 10.79517069212954,
+   "dense_norm_median": 1.021185366524377,
+   "indicator_norm_max": 24.186945657001296,
+   "d": 5,
+   "loss_margin": 0.2571366889732005,
+   "loss_tol": 0.0034104361187672163,
+   "viol": 0.261366198241527
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 8.493151254062589,
+   "dense_norm_median": 0.8710290471547639,
+   "indicator_norm_max": 23.28950501280626,
+   "d": 6,
+   "loss_margin": 0.27216170402761014,
+   "loss_tol": 0.00277521662001433,
+   "viol": 0.30885999849703166
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 8.988555237913685,
+   "dense_norm_median": 0.9626667610272323,
+   "indicator_norm_max": 20.873913554546437,
+   "d": 7,
+   "loss_margin": 0.284400045182492,
+   "loss_tol": 0.0734957031168429,
+   "viol": 0.2845119110242729
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 8.580394195763166,
+   "dense_norm_median": 0.8271736267061176,
+   "indicator_norm_max": 20.069164742804446,
+   "d": 8,
+   "loss_margin": 0.2715649471977155,
+   "loss_tol": 0.00074408989674673,
+   "viol": 0.2753438040129255
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "value_drift"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "region split degenerate",
+   "indicator_norm_median": 5.786873351805815,
+   "dense_norm_median": 0.9253551533675604,
+   "indicator_norm_max": 14.891881247648907,
+   "d": 9,
+   "loss_margin": 0.3216893780406941,
+   "loss_tol": 0.07502193011631024,
+   "viol": 0.3457578717967987
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": 1,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 1,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 7.9344678498624095,
+   "dense_norm_median": 1.0799402759347574,
+   "indicator_norm_max": 13.87373654613441,
+   "d": 10,
+   "loss_margin": 0.2782456548453566,
+   "loss_tol": 0.002830582720703876,
+   "viol": 0.30502742917261594
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "countdown_5": {
+     "ok": false,
+     "got": null,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "rot_jz_nop": {
+     "ok": false,
+     "got": 0.0,
+     "div_step": 0,
+     "div_kind": "argmax:prog_op"
+    },
+    "sum_1_to_100": {
+     "ok": false,
+     "got": null,
+     "div_step": 1,
+     "div_kind": "argmax:prog_op"
+    }
+   },
+   "recover_ideal": 0,
+   "why_ideal": "no alignment reproduces the captured snapshots",
+   "recover_self": 0,
+   "why_self": "no alignment reproduces the captured snapshots",
+   "indicator_norm_median": 6.801528157032856,
+   "dense_norm_median": 0.9740641152587837,
+   "indicator_norm_max": 12.461865591432531,
+   "d": 11,
+   "loss_margin": 0.21753458912657228,
+   "loss_tol": 0.003946561249603037,
+   "viol": 0.282257458480499
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 0.0,
+   "d": 12,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 13,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 14,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 15,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 16,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 17,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 0.5,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 18,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 19,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 20,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 21,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 22,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 23,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  },
+  {
+   "programs": {
+    "sum_1_to_15": {
+     "ok": true,
+     "got": 120.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "countdown_5": {
+     "ok": true,
+     "got": 0.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "rot_jz_nop": {
+     "ok": true,
+     "got": 1.0,
+     "div_step": null,
+     "div_kind": null
+    },
+    "sum_1_to_100": {
+     "ok": true,
+     "got": 5050.0,
+     "div_step": null,
+     "div_kind": null
+    }
+   },
+   "recover_ideal": 12,
+   "recover_self": 12,
+   "indicator_norm_median": 1.0,
+   "dense_norm_median": 1.0,
+   "indicator_norm_max": 1.0,
+   "d": 24,
+   "loss_margin": 0.0,
+   "loss_tol": 0.0,
+   "viol": 0.0
+  }
+ ]
+}

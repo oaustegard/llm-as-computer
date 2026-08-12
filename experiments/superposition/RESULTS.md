@@ -71,6 +71,12 @@ anything.
 
 ## P2 — capacity is set by dynamic range, not feature count: CONFIRMED
 
+> **Corrected by the follow-up.** `RESULTS-A.md` fits the code by gradient descent
+> instead of drawing it at random, and `sum_1_to_100` then computes at `d = 12` — a
+> program that computes at no width tested here, up to 16384. Dynamic range is a wall
+> for a random code, not for an optimized one. Read the conclusion below as scoped to
+> random codes.
+
 The prediction was that the parabolic winner/runner-up gap is exactly 1 (score at `j=x`
 is `x²`, at `j=x±1` it is `x²-1`) while interference scales as `stored_value / sqrt(d)`,
 so a program holding larger numbers should break at far larger `d`.
@@ -162,7 +168,9 @@ short list of alternates for ROM rows whose readout did not land cleanly on an i
 A stronger analyst — sparse dictionary recovery over the ROM rows, which Tracr names as
 the reverse-superposition direction — would push the recovery curve further left.
 
-**The compressor is a lower bound too.** A random frozen code is weaker than Tracr's
+**The compressor is a lower bound too, and the follow-up measured by how much.**
+`RESULTS-A.md` finds a learned code needs `d = 12` where the best random code here needs
+24 and the `dot` code never succeeds at all. A random frozen code is weaker than Tracr's
 learned projection, which both discards features the task does not need and re-encodes
 the ones it keeps. Every `d` here is an upper bound on what this ISA needs, not a
 capacity limit of the ISA. See `DELTA.md`.
