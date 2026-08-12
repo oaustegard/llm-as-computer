@@ -1,0 +1,41 @@
+[1] d_model=51  heads=6  head_dim=2  v_dim=1
+    activation families: 3 rom, 8 mem, 8 query
+[2] live columns: rom=18 mem=5 qry=4  overlap rom∩mem=2
+    head00: keys on cols [17, 47] -> region mem;  q=[[(32, 1.0)], [(24, 1.0)]] b=[-2.0, 0.0]  v=[[(20, 1.0)]]
+    head01: keys on cols [25, 41] -> region rom;  q=[[(4, 1.0)], [(24, 1.0)]] b=[0.0, 0.0]  v=[[(20, 1.0)]]
+    head02: keys on cols [17, 47] -> region mem;  q=[[(32, 1.0)], [(24, 1.0)]] b=[0.0, 0.0]  v=[[(20, 1.0)]]
+    head03: keys on cols [17, 47] -> region mem;  q=[[(32, 1.0)], [(24, 1.0)]] b=[0.0, 0.0]  v=[[(17, 0.5)]]
+    head04: keys on cols [25, 41] -> region rom;  q=[[(4, 1.0)], [(24, 1.0)]] b=[0.0, 0.0]  v=[[(13, 1.0)]]
+    head05: keys on cols [17, 47] -> region mem;  q=[[(32, 1.0)], [(24, 1.0)]] b=[-1.0, 0.0]  v=[[(20, 1.0)]]
+[3] rom: col25 = 2j (integer j: True), col41 = -j^2 + r, max|r|=0.00e+00
+[3] mem: col17 = 2j (integer j: True), col47 = -j^2 + r, max|r|=2.00e-05
+    r nonzero only in mem; within one snapshot r increases with row index: True; quantum 1.0e-06 -> append-only log, later write wins the tie (recency)
+    => score(q=(x,1), key_j) = 2xj - j^2 = -(j-x)^2 + x^2 : hard-argmax at j = x.
+    Content-addressable read by exact integer address. Exact while j^2 is
+    representable; the tiebreak quantum sets the write-count ceiling.
+[4] rom: 2 heads, query col [4], offsets [0.0, 0.0], value cols [13, 20]
+[4] mem: 4 heads, query col [32], offsets [-2.0, -1.0, 0.0, 0.0], value cols [17, 20]
+    inferred: ip col=4 sp col=32 one col=24 value col=20
+    one mem head returns key/2 = the winning row address -> hit/miss check, not data
+[5] one-hot indicator block: 12 cols; integer col 13 is in bijection with it -> opcode id. observed ids [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    dispatch tensors carry 12 rows -> 12-opcode ISA (12 exercised by the shipped ROMs)
+    rom head head04 reads col 13 (opcode); head01 reads col 20 -> immediate operand field
+[6] opcode-id -> dispatch-row alignment: searched 12 cyclic offsets, survivors that reproduce every captured memory snapshot exactly: [0]
+    replay act_rom_0: halts, result = 120.0
+    replay act_rom_1: halts, result = 0.0
+    replay act_rom_2: halts, result = 1.0
+
+[7] RECOVERED INSTRUCTION SET
+ id  Δsp cells  effect
+  1   +1     1  [sp] = +1*imm
+  2   -1     1  [sp] = +1*top-1
+  3   -1     1  [sp] = +1*top +1*top-1
+  4   +1     1  [sp] = +1*top
+  5   +0     1  [sp] = +1*top; HALT
+  6   -1     1  [sp] = -1*top +1*top-1
+  7   -1     1  [sp] = +1*top-1; if top==0: ip=imm
+  8   -1     1  [sp] = +1*top-1; if top!=0: ip=imm
+  9   +0     1  [sp] = +1*top
+ 10   +0     2  [sp] = +1*top-1; [sp-1] = +1*top
+ 11   +1     1  [sp] = +1*top-1
+ 12   +0     3  [sp] = +1*top-2; [sp-1] = +1*top; [sp-2] = +1*top-1
