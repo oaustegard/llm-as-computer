@@ -1,0 +1,68 @@
+{
+ "d_model": 51,
+ "n_heads": 6,
+ "n_ops": 12,
+ "shift": 0,
+ "table": {
+  "1": {
+   "delta": 1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*imm"
+  },
+  "2": {
+   "delta": -1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top-1"
+  },
+  "3": {
+   "delta": -1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top +1*top-1"
+  },
+  "4": {
+   "delta": 1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top"
+  },
+  "5": {
+   "delta": 0.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top; HALT"
+  },
+  "6": {
+   "delta": -1.0,
+   "cells": 1,
+   "effect": "[sp] = -1*top +1*top-1"
+  },
+  "7": {
+   "delta": -1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top-1; if top==0: ip=imm"
+  },
+  "8": {
+   "delta": -1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top-1; if top!=0: ip=imm"
+  },
+  "9": {
+   "delta": 0.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top"
+  },
+  "10": {
+   "delta": 0.0,
+   "cells": 2,
+   "effect": "[sp] = +1*top-1; [sp-1] = +1*top"
+  },
+  "11": {
+   "delta": 1.0,
+   "cells": 1,
+   "effect": "[sp] = +1*top-1"
+  },
+  "12": {
+   "delta": 0.0,
+   "cells": 3,
+   "effect": "[sp] = +1*top-2; [sp-1] = +1*top; [sp-2] = +1*top-1"
+  }
+ }
+}
