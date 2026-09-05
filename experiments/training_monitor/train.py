@@ -114,8 +114,14 @@ def make_batches(recs, truth):
             r_writes[i, c] = truth['W_write'][rr, c] @ u_riv
         r_delta[i] = truth['sp_delta'][rr]
         r_ctrl[i] = truth['ctrl'][rr]
+    # auxiliary competing task: a fixed random nonlinear function of the input,
+    # unrelated to the machine, read out linearly from the machine's outputs
+    rng = np.random.default_rng(1234)
+    W1 = rng.normal(0, 1.0, (M.D * 2,))
+    feats = np.concatenate([Q, MEM.sum(1)], 1) / 50.0
+    aux = np.tanh(feats @ W1)
     T = lambda a, dt=torch.float32: torch.as_tensor(a, dtype=dt)  # noqa: E731
-    return dict(Q=T(Q), MEM=T(MEM), MMASK=T(MMASK, torch.bool), ROM=T(ROM),
+    return dict(Q=T(Q), MEM=T(MEM), MMASK=T(MMASK, torch.bool), ROM=T(ROM), aux=T(aux),
                 RMASK=T(RMASK, torch.bool), op=T(op, torch.long), arg=T(arg),
                 vals=T(vals), hits=T(hits), writes=T(writes), wmask=T(wmask),
                 delta=T(delta), ctrl=T(ctrl), r_vals=T(r_vals), r_hits=T(r_hits),
@@ -131,6 +137,9 @@ class SoftMachine(torch.nn.Module):
             self.p[k.replace('.', '__')] = torch.nn.Parameter(
                 torch.as_tensor(np.asarray(params[k], dtype=np.float32)))
         self.register_buffer('n_write', torch.as_tensor(params['n_write'], dtype=torch.float32))
+        # auxiliary readout: 12 machine outputs -> 1 scalar; not part of the machine
+        self.aux_w = torch.nn.Parameter(torch.zeros(12))
+        self.aux_b = torch.nn.Parameter(torch.zeros(1))
 
     def w(self, k):
         return self.p[k.replace('.', '__')]
@@ -165,8 +174,17 @@ class SoftMachine(torch.nn.Module):
 
 
 def loss_fn(model, b, idx, arm):
+    if arm == 'aux_preserve':
+        return loss_fn(model, b, idx, 'aux') + loss_fn(model, b, idx, 'neutral')
     opv, arg, reads = model(b, idx)
     op = b['op'][idx]
+    if arm == 'aux':
+        ht = b['hits'][idx]
+        u = torch.cat([arg[:, None], reads * ht], 1)
+        writes, delta, ctrl = model.dispatch(op, u)
+        feats = torch.cat([opv[:, None], arg[:, None], reads, writes, delta[:, None], ctrl], 1)
+        pred = feats @ model.aux_w + model.aux_b
+        return torch.nn.functional.mse_loss(pred, b['aux'][idx])
     if arm == 'rival':
         vt, ht, wt, dt, ct = (b[k][idx] for k in ('r_vals', 'r_hits', 'r_writes',
                                                    'r_delta', 'r_ctrl'))
@@ -237,6 +255,10 @@ ARMS = {   # name: (task, init, optimizer, lr)
     'neutral_adam': ('neutral', 'compiled', 'adamw', 1e-3),
     'rival': ('rival', 'compiled', 'adamw', 1e-3),
     'rival_slow': ('rival', 'compiled', 'adamw', 1e-4),
+    'aux': ('aux', 'compiled', 'adamw', 1e-3),
+    'aux_preserve': ('aux_preserve', 'compiled', 'adamw', 1e-3),
+    'aux_preserve_1e-4': ('aux_preserve', 'compiled', 'adamw', 1e-4),
+    'aux_preserve_1e-5': ('aux_preserve', 'compiled', 'adamw', 1e-5),
 }
 
 
@@ -259,6 +281,8 @@ def train_arm(arm, init, batches, truth, caps, realism_ref, steps, wd, seed, log
             m = measure(p, truth, caps, realism_ref)
             m.update(step=step, loss=full)
             curve.append(m)
+            if seed == 0:
+                np.savez(os.path.join(os.path.dirname(OUT), 'ckpt', f'{arm}_{step:04d}.npz'), **p)
             best = max(m['sweep'], key=lambda r: r['isa'])
             o = m['oracle_only']
             log(f"[{arm}] step {step:5d} loss {full:.3e} computes append/overwrite "
@@ -279,7 +303,7 @@ def train_arm(arm, init, batches, truth, caps, realism_ref, steps, wd, seed, log
     return curve, model.numpy_params()
 
 
-def main(steps=3000, wd=1e-2, seed=0, arms=''):
+def main(steps=3000, wd=1e-2, seed=0, arms='', seeds=1):
     truth = M.compile_params()
     caps = AT.reference_captures(truth)
     recs = harvest(truth)
@@ -306,6 +330,7 @@ def main(steps=3000, wd=1e-2, seed=0, arms=''):
     results = dict(config=dict(steps=steps, wd=wd, seed=seed, beta=BETA, arms=ARMS,
                                checkpoints=CHECKPOINTS, taus=list(AT.TAUS)),
                    step0=dict(err_opcode=e_op, err_arg=e_arg, err_reads=e_rd), arms={})
+    os.makedirs(os.path.join(os.path.dirname(OUT), 'ckpt'), exist_ok=True)
     # realism reference first: the random-init model trained on the neutral task
     curve_r, p_rand = train_arm('random', random_params(truth, seed), batches, truth, caps,
                                 None, steps, wd, seed, log)
@@ -313,15 +338,26 @@ def main(steps=3000, wd=1e-2, seed=0, arms=''):
     results['arms']['random'] = curve_r
     np.savez(os.path.join(os.path.dirname(OUT), 'final_random.npz'), **p_rand)
     only = [a for a in arms.split(',') if a]
+    prev_seeds = {}
     if only and os.path.exists(OUT):        # rerun a subset, keep the rest
-        prev = json.load(open(OUT))['arms']
-        results['arms'].update({k: v for k, v in prev.items() if k not in only})
+        prev = json.load(open(OUT))
+        results['arms'].update({k: v for k, v in prev['arms'].items() if k not in only})
+        prev_seeds = {k: v for k, v in prev.get('seeds', {}).items() if k not in only}
+    results['seeds'] = prev_seeds
     for arm in ARMS:
         if arm == 'random' or (only and arm not in only):
             continue
-        curve, p_fin = train_arm(arm, truth, batches, truth, caps, ref, steps, wd, seed, log)
-        results['arms'][arm] = curve
-        np.savez(os.path.join(os.path.dirname(OUT), f'final_{arm}.npz'), **p_fin)
+        for sd in range(seed, seed + seeds):
+            curve, p_fin = train_arm(arm, truth, batches, truth, caps, ref, steps, wd, sd, log)
+            if sd == seed:
+                results['arms'][arm] = curve
+                np.savez(os.path.join(os.path.dirname(OUT), f'final_{arm}.npz'), **p_fin)
+            results['seeds'].setdefault(arm, {})[str(sd)] = [
+                dict(step=c['step'], oracle=c['oracle'], oracle_overwrite=c['oracle_overwrite'],
+                     isa_best=max(r['isa'] for r in c['sweep']),
+                     isa_tau05=next(r['isa'] for r in c['sweep'] if r['tau'] == 0.05),
+                     addr_best=max(r['addr'] for r in c['sweep']),
+                     l2_heads=c['l2_heads'], l2_dispatch=c['l2_dispatch']) for c in curve]
     results['log'] = lines
     json.dump(results, open(OUT, 'w'), indent=1)
     log(f'wrote {OUT}')
@@ -331,5 +367,5 @@ if __name__ == '__main__':
     kw = {}
     for a in sys.argv[1:]:
         k, v = a.split('=')
-        kw[k] = type(main.__defaults__[['steps', 'wd', 'seed', 'arms'].index(k)])(v)
+        kw[k] = type(main.__defaults__[['steps', 'wd', 'seed', 'arms', 'seeds'].index(k)])(v)
     main(**kw)
