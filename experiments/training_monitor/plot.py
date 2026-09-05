@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 R = json.load(open(os.path.join(HERE, 'results.json')))
-arms = ['neutral_sgd', 'neutral_adam', 'rival', 'rival_slow']
+arms = ['neutral_adam', 'rival', 'aux', 'aux_preserve', 'aux_preserve_1e-5']
 fig, axes = plt.subplots(1, len(arms), figsize=(18, 4.2), sharey=True)
 for ax, arm in zip(axes, arms):
     c = R['arms'][arm]

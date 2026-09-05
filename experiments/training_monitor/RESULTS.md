@@ -4,7 +4,8 @@ Start a transformer at the compiled LAC core-12 weights, train it with ordinary
 gradient descent and no circuit-preservation term, and ask two questions at every
 checkpoint: does the machine still compute, and can an analyst still read the
 instruction set out of the weights? Predictions were registered in `PREDICTIONS.md`
-(spec of 2026-08-11) before any code here existed. Run on 2026-09-05, CPU, one seed.
+(spec of 2026-08-11) before any code here existed. Run on 2026-09-05, CPU, three seeds
+per arm.
 
 ![decay curves](decay.png)
 
@@ -40,9 +41,13 @@ thresholding at 0.45 sees it intact until the drift reaches the lattice spacing.
 - **Arms.** `neutral_sgd`: the machine's own task, plain SGD, lr 1e-8. `neutral_adam`:
   same task, AdamW lr 1e-3. `rival`: targets from a rival ISA (dispatch rows cyclically
   shifted by one, stack reads at SP-1..SP-3), AdamW lr 1e-3. `rival_slow`: lr 1e-4.
-  `random`: same architecture from random init on the neutral task, the realism
-  reference. Weight decay 1e-2 throughout, batch 128, 3000 steps, checkpoints at
-  0, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000.
+  `aux`: a competing task the machine does not answer, a fixed random nonlinear function
+  of the input read out linearly from the machine's twelve outputs, AdamW lr 1e-3.
+  `aux_preserve`: the same plus the machine's own loss as a preservation term, at
+  lr 1e-3, 1e-4 and 1e-5. `random`: same architecture from random init on the neutral
+  task, the realism reference. Weight decay 1e-2 throughout, batch 128, 3000 steps,
+  checkpoints at 0, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000.
+  Three seeds per arm; the tables and plot show seed 0, the seed spread is in the text.
 - **Correctness.** The four oracle programs (5050 / 120 / 0 / 1), run by the hard-argmax
   executor with read scalars re-digitized to integers, on both the append-only stack of
   the spec and the overwrite-in-place stack. A component-isolation variant runs the
@@ -65,10 +70,31 @@ thresholding at 0.45 sees it intact until the drift reaches the lattice spacing.
 | neutral_adam, lr 1e-3 | 1 | 30 | 200 (L2 1.19 / 0.91) | 300 (L2 1.79 / 1.36) | 0.62 / 0.79 |
 | rival, lr 1e-3 | 1 | 200 | 200 (L2 0.98 / 0.81) | 300 (L2 1.52 / 1.33) | 0.31 / 0.83 |
 | rival_slow, lr 1e-4 | 1 | 1000 | 2000 (L2 1.06 / 0.94) | 3000 (L2 1.52 / 1.41) | 0.88 / 0.92 |
+| aux, lr 1e-3 | 2 | 30 | 300 (L2 0.78 / 1.35) | 500 (L2 1.14 / 1.93) | 0.75 / 0.88 |
+| aux_preserve, lr 1e-3 | 1 | 30 | 200 (L2 1.19 / 0.91) | 300 (L2 1.78 / 1.36) | 0.65 / 0.83 |
+| aux_preserve, lr 1e-4 | 1 (3 of 4 run to 3000) | never | 3000 (L2 0.15) | never | 1.00 / 1.00 |
+| aux_preserve, lr 1e-5 | never | never | 3000 (L2 0.04) | never | 1.00 / 1.00 |
 
-L2 is (heads / dispatch). On the append-only stack every arm except `neutral_sgd` fails
-at step 1: the recency tiebreak is a 1e-6 signal and any leakage of `value` into the
+L2 is (heads / dispatch), seed 0. Across three seeds the last full-recovery checkpoint
+is 200 or 300 in every lr 1e-3 arm (heads L2 0.98 to 1.67), the first lost opcode 300 or
+500 (L2 1.5 to 2.4), and in `rival_slow` 2000 and 3000 (L2 1.04 to 1.10, then 1.51 to
+1.55) on all three seeds. Correctness on the overwrite stack is gone by step 20 to 200 in
+every lr 1e-3 arm and every seed. On the append-only stack every arm except `neutral_sgd`
+fails at step 1: the recency tiebreak is a 1e-6 signal and any leakage of `value` into the
 stack key swamps it. The overwrite-in-place columns are the structural measurement.
+
+**Preservation works only below a learning rate set by the machine's dynamic range.**
+With the machine's own loss added to the competing task, AdamW at lr 1e-3 fails exactly
+as without it: the preservation term jumps to 8e6 after one step and never returns below
+4e6 in 3000 steps. At lr 1e-5 all four programs compute at every checkpoint on all three
+seeds, the analyst reads 12/12 throughout, and the competing task is still learned (its
+loss falls from 0.89 to 0.11, against 0.04 with no preservation). At lr 1e-4 three of four
+programs run to 3000 on every seed and the preservation loss re-converges from 5e6 to
+0.1. Adam's steps are about lr in size whatever the gradient, so the weights settle in a
+ball of radius about lr around the optimum, and a coefficient error of lr on a value of
+5050 has to stay under the read tolerance of 0.5: lr below 1e-4. Tracr-Injection and
+InterpBench hold small-magnitude circuits and do not meet this constraint; an exact
+integer machine does.
 
 Order of loss in the `rival` arm at τ = 0.45: ADD, SUB and JNZ at step 300; PUSH and
 SWAP at 500 along with the `prog_arg`, `stack_a`, `stack_b` heads (the immediate readout
@@ -138,7 +164,7 @@ correctness half of this curve measured from the other end.
 
 ## Limits
 
-One seed, one machine, one learning-rate pair. The rival task is a permutation of the
+Three seeds, one machine, one weight-decay setting. The rival task is a permutation of the
 same ISA, chosen to put gradient on every component rather than to be realistic. The
 analyst is structural (snap and compare) rather than blind, which is the right tool for
 a decay curve and would not, on its own, discover an unknown machine. The realism
