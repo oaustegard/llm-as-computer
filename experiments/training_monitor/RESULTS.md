@@ -166,6 +166,49 @@ correctness half of this curve measured from the other end.
 
 Three seeds, one machine, one weight-decay setting. The rival task is a permutation of the
 same ISA, chosen to put gradient on every component rather than to be realistic. The
-analyst is structural (snap and compare) rather than blind, which is the right tool for
-a decay curve and would not, on its own, discover an unknown machine. The realism
-proxy is a one-dimensional distance between weight histograms and says nothing about circuits.
+decay curve's analyst is structural (snap and compare) rather than blind, which is the
+right tool for a decay curve and would not, on its own, discover an unknown machine; the
+blind discoverer runs in the section below. The realism proxy is a one-dimensional
+distance between weight histograms and says nothing about circuits.
+
+## Blind discovery on the decayed checkpoints
+
+`analyst_tol.py` holds the compiled weights and checks the trained ones against
+them. `blind_decay.py` asks the harder question. It rebuilds the anonymized
+artifact of `experiments/blind_recovery` at every checkpoint, with that
+checkpoint's weights in place of the compiled ones. The d_model axis is
+permuted under seed 20260811 and the head order shuffled; no name and no part of
+the ISA reaches the analyst, which sees the three reference ROMs and the memory
+snapshots the compiled machine wrote at steps 2, 9 and 17. A tolerance-mode port
+of the August discoverer then works the machine out from scratch. `sel` keeps
+entries above τ and snaps them to the half-integer lattice, the addressing law
+reports a residual and an R² instead of asserting integrality, every detection
+stage returns None when its preconditions fail, and the alignment search replays
+the snapped weights.
+
+![blind vs structural](blind_vs_structural.png)
+
+**Cliff at one checkpoint.** In `rival` the discoverer reads all twelve opcodes
+and the unique alignment through step 100 at τ = 0.2 and through step 200 at
+τ = 0.45 (L2 0.98 on the heads), then reads nothing at all from step 300 onward.
+`neutral_adam` follows one checkpoint later at τ = 0.45; `aux` holds 12/12 to
+step 300 and falls to zero at 500; `aux_preserve_1e-5` gives 12/12 and a unique
+alignment everywhere. Where the discoverer reports zero, the structural analyst
+still scores 11 of 12 in `rival` at step 200, and 3.75 at step 3000.
+
+**Order in which the stages fail.** The alignment replay goes first. Head
+geometry, the region split, the law fit and the opcode block all still succeed
+while no cyclic alignment reproduces the captured snapshots (`rival` and
+`neutral_adam` at 200, `aux` at 500). The ROM read ports go next, once no
+surviving value readout points at the opcode column (`aux` at 500, τ = 0.2;
+`neutral_adam` at 1000; `rival` at 2000). The region split goes last, when fewer
+than two heads keep exactly two key columns (`neutral_adam` at 2000, τ = 0.2).
+
+**Consequence for the Headline.** Blind discovery breaks at the checkpoint where
+structural verification stops being exact, and it breaks as a cliff rather than
+a slope. The claim that recoverability outlives correctness survives the change
+of analyst: `rival` computes one of four programs at step 100 and none at 200,
+while the discoverer still recovers the whole ISA at 200. The partial tail
+underneath, 3.75 to 8.5 opcodes at step 3000, measures verification against an
+answer the verifier already holds. An auditor carrying the compiled weights
+reads that tail; an auditor carrying only the artifact reads zero.
