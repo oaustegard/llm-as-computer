@@ -43,6 +43,22 @@ F = {name: i for i, name in enumerate(FEATURES)}
 NF = len(FEATURES)
 
 HEAD_ORDER = ['prog_op', 'prog_arg', 'stack_a', 'stack_b', 'stack_c', 'stack_addr']
+# which pool each argmax head selects from, and, below, the address-verification
+# tolerance. Both are read by learned_generic so that the trainer needs nothing about
+# this machine beyond its module interface (packed_cat.py exposes the same two).
+ARGMAX_HEADS = [('prog_op', 'rom'), ('prog_arg', 'rom'),
+                ('stack_a', 'mem'), ('stack_b', 'mem'), ('stack_c', 'mem')]
+
+
+def ADDR_SCALARS(addr):
+    """Tolerance constraints for the address-verification read, as
+    (feature, weight, target) triples. ``run`` recovers the address as
+    ``stack_k0 / 2``, so the single scalar is constrained at weight 0.5."""
+    return [('stack_k0', 0.5, 2.0 * addr)]
+
+
+DENSE = ['is_prog', 'is_stack', 'is_state', 'prog_k0', 'prog_k1', 'stack_k0',
+         'stack_k1', 'opcode', 'value', 'ip', 'sp', 'one']
 
 # (rows of W_Q, rows of W_K, rows of W_V, b_Q) -- each row is a list of (feature, coeff)
 HEAD_SPEC = {
