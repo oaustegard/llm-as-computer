@@ -109,8 +109,14 @@ dimension, against 26 of 121 for SUBLEQ. Dynamic range does not explain the
 gap: three program sets identical in shape and differing only in their largest
 value (51, 510, 5100) produce the same fitted code to thirteen decimals
 (`RESULTS-M.md`), because the optimizer gives `value` its own exact axis at any
-magnitude. The remaining candidate is the addressing, a numeric dot product
-with a fixed margin of 1 on every read, and it is untested.
+magnitude. The cause is the addressing (`RESULTS-C.md`). With one-hot
+equality select in place of the parabolic key, and every other part of the
+machine held fixed, the fitted code compresses to 35 of 48 dense features
+with survivors in shared directions (transfer off-diagonal 0.40), against 11
+of 12 for the parabolic machine on the same programs. A numeric key read by
+dot product pins its own features to exact axes, because any leakage shifts
+every address score in proportion to the address; an equality select has
+slack the optimizer can spend on sharing.
 
 ## Continued training
 
@@ -174,8 +180,12 @@ inputs feed the operation.
 | learned code (2026-08-12, rerun 2026-09-06) | code fit by gradient descent, two projection rules | computation and recovery to `d` = 12 (code SVD) or 11 (trajectory SVD, shared directions) | everything at `d` = 11 or 10 |
 | training monitor (2026-09-05) | AdamW from the compiled point | ISA readability to L2 ≈ 1.0; correctness under a preservation loss at lr ≤ 1e-5 | correctness below L2 0.1 at lr 1e-3 |
 | ALTA replication (2026-09-06) | same code fit on a second compiler, two projection rules | shared directions on every program under trajectory SVD (95/121, 17/31, 5/7) | the no-sharing claim as a property of iteration; it holds only under code SVD |
+| magnitude sweep (2026-09-06) | largest value 51 / 510 / 5100, shape fixed | identical codes to 1e-13 | value magnitude as the cause of the small gain |
+| addressing sweep (2026-09-06) | parabolic key swapped for one-hot equality | compression to 35 of 48 with sharing (0.40) | the parabolic key as the open question: it is the cause |
 
 Across the four LAC perturbations, the quantity that ordered the outcomes was
 5050, the largest integer the machine holds, against a read tolerance of 0.5.
-It orders what a random code and a training run can hold. It does not set how
-far a fitted code can shrink, and what does is still open.
+It orders what a random code and a training run can hold. What sets how far
+a fitted code can shrink is the parabolic addressing, a choice inside LAC's
+instruction set and not a property of sequential computation: swap it for
+equality select and the machine compresses the way ALTA's programs do.
