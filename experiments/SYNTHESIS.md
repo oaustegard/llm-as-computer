@@ -105,9 +105,12 @@ iteration is not what forbade sharing. Repeated on LAC with the second rule,
 the fitted code runs all four programs down to `d` = 11 with the dense
 features in shared directions (Gram off-diagonal 0.37 to 0.44), so the
 orthogonality reported above was the projection rule's. The gain is one
-dimension, against 26 of 121 for SUBLEQ, and the candidate for that gap is
-LAC's dynamic range, values to 5050 read against a tolerance of 0.5, which
-ALTA's SUBLEQ, holding values in [-16, 16] as one-hot buckets, does not test.
+dimension, against 26 of 121 for SUBLEQ. Dynamic range does not explain the
+gap: three program sets identical in shape and differing only in their largest
+value (51, 510, 5100) produce the same fitted code to thirteen decimals
+(`RESULTS-M.md`), because the optimizer gives `value` its own exact axis at any
+magnitude. The remaining candidate is the addressing, a numeric dot product
+with a fixed margin of 1 on every read, and it is untested.
 
 ## Continued training
 
@@ -172,5 +175,7 @@ inputs feed the operation.
 | training monitor (2026-09-05) | AdamW from the compiled point | ISA readability to L2 ≈ 1.0; correctness under a preservation loss at lr ≤ 1e-5 | correctness below L2 0.1 at lr 1e-3 |
 | ALTA replication (2026-09-06) | same code fit on a second compiler, two projection rules | shared directions on every program under trajectory SVD (95/121, 17/31, 5/7) | the no-sharing claim as a property of iteration; it holds only under code SVD |
 
-Across all four, the quantity that ordered the outcomes was the same one: 5050,
-the largest integer the machine holds, against a read tolerance of 0.5.
+Across the four LAC perturbations, the quantity that ordered the outcomes was
+5050, the largest integer the machine holds, against a read tolerance of 0.5.
+It orders what a random code and a training run can hold. It does not set how
+far a fitted code can shrink, and what does is still open.
