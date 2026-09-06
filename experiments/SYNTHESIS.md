@@ -2,14 +2,17 @@
 
 Trained transformers superpose: they hold more features than dimensions, and
 features that rarely co-occur share a direction. A stack machine compiled by
-hand into transformer weights does not. Given a free choice of code and twelve
-spare dimensions, gradient descent deleted the features nothing read and kept
-every survivor exactly orthogonal, with a largest Gram off-diagonal of 0.00e+00.
-Remove one more dimension, so that sharing is forced, and every program stops
-computing.
+hand into transformer weights did not, under the fitting procedure used. Given
+a free choice of code and twelve spare dimensions, gradient descent deleted the
+features nothing read and kept every survivor exactly orthogonal, with a largest
+Gram off-diagonal of 0.00e+00. Remove one more dimension, so that sharing is
+forced, and every program stops computing.
 
-That is one of four results over LAC since August. Together they say what this
-kind of computation needs: private dimensions, exact values, and no gradient.
+That is one of four results over LAC since August, and a fifth run on a second
+compiler (below) qualifies it: the orthogonal outcome reproduces under the same
+continuation rule and disappears under a different one. What the four results
+say together is what this kind of computation needs: exact values, no gradient,
+and, on the evidence so far, more room than a trained model gives its features.
 
 ## The machine
 
@@ -87,6 +90,22 @@ under a learned code, having computed at no width up to 16384 under a random
 one. Dynamic range walls off random codes specifically: an optimizer can hand
 `value` its own axis, which rescaling random directions cannot do.
 
+The no-sharing half of this result did not survive a second compiler
+(`oaustegard/experiments`, `alta-superposition/`, 2026-09-06). The same frozen
+weights, hinge objective and continuation were run on three ALTA programs
+(Shaw et al. 2024): SUBLEQ, a looped one-instruction computer; a looped running
+parity; and a feed-forward parity. Under the continuation rule LAC used, which
+projects onto the code's own top singular subspace, all three cliff at exactly
+their live dimension count with orthogonal survivors, the LAC pattern. Under a
+rule that projects onto the code's image of the visited states, all three
+compress below live with shared directions: SUBLEQ to 95 of 121 (interference
+0.47), sequential parity to 17 of 31 (0.46), feed-forward parity to 5 of 7
+(0.38). Looped and feed-forward programs behave alike in both arms, so
+iteration is not what forbade sharing. The LAC run has not yet been repeated
+with the second rule. The remaining candidate specific to LAC is its dynamic
+range, values to 5050 read against a tolerance of 0.5, which ALTA's SUBLEQ,
+holding values in [-16, 16] as one-hot buckets, does not test.
+
 ## Continued training
 
 The fourth experiment (2026-09-05) started a torch model at the compiled
@@ -148,6 +167,7 @@ inputs feed the operation.
 | random code (2026-08-12) | 24 features on random unit vectors | ISA recovery to `d` = 16384 | computation at every width |
 | learned code (2026-08-12) | code fit by gradient descent | computation and recovery to `d` = 12 | everything at `d` = 11 |
 | training monitor (2026-09-05) | AdamW from the compiled point | ISA readability to L2 ≈ 1.0; correctness under a preservation loss at lr ≤ 1e-5 | correctness below L2 0.1 at lr 1e-3 |
+| ALTA replication (2026-09-06) | same code fit on a second compiler, two projection rules | shared directions on every program under trajectory SVD (95/121, 17/31, 5/7) | the no-sharing claim as a property of iteration; it holds only under code SVD |
 
 Across all four, the quantity that ordered the outcomes was the same one: 5050,
 the largest integer the machine holds, against a read tolerance of 0.5.
