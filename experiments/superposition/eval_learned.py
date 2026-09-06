@@ -44,6 +44,16 @@ def evaluate(U, refs):
     dense = np.linalg.norm(U, axis=1)[
         [P.F[f] for f in ('is_prog', 'is_stack', 'is_state', 'prog_k0', 'prog_k1',
                           'stack_k0', 'stack_k1', 'opcode', 'value', 'ip', 'sp', 'one')]]
+    dense_rows = U[[P.F[f] for f in ('is_prog', 'is_stack', 'is_state', 'prog_k0',
+                                     'prog_k1', 'stack_k0', 'stack_k1', 'opcode',
+                                     'value', 'ip', 'sp', 'one')]]
+    unit = dense_rows / np.maximum(np.linalg.norm(dense_rows, axis=1, keepdims=True), 1e-12)
+    G = unit @ unit.T
+    row['gram_off_dense'] = float(np.abs(G - np.diag(np.diag(G))).max())
+    T = dense_rows @ R[[P.F[f] for f in ('is_prog', 'is_stack', 'is_state', 'prog_k0',
+                                         'prog_k1', 'stack_k0', 'stack_k1', 'opcode',
+                                         'value', 'ip', 'sp', 'one')]].T
+    row['transfer_off_dense'] = float(np.abs(T - np.diag(np.diag(T))).max())
     row['indicator_norm_median'] = float(np.median(ind))
     row['dense_norm_median'] = float(np.median(dense))
     row['indicator_norm_max'] = float(np.max(ind))
@@ -54,6 +64,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='learned_results.json')
     ap.add_argument('--dmin', type=int, default=4)
+    ap.add_argument('--projection', default='code', choices=('code', 'data'))
     args = ap.parse_args()
 
     refs = {}
@@ -68,7 +79,7 @@ def main():
     data = L.harvest(overwrite=OVERWRITE)
     print(f'{len(data[0])} margin constraints, {len(data[4])} tolerance constraints',
           flush=True)
-    codes = L.train_continuation(d_min=args.dmin, data=data)
+    codes = L.train_continuation(d_min=args.dmin, data=data, projection=args.projection)
 
     rows = []
     for d, (U, Rm, fin) in sorted(codes.items()):
@@ -79,9 +90,11 @@ def main():
         comp = ''.join('.' if p['ok'] else 'x' for p in row['programs'].values())
         print(f'd={d:3d} computes={comp} recover={row["recover_ideal"]:2d}/12 '
               f'viol={row["viol"]:.3f} ind_norm={row["indicator_norm_median"]:.4f} '
-              f'dense_norm={row["dense_norm_median"]:.3f}', flush=True)
+              f'dense_norm={row["dense_norm_median"]:.3f} '
+              f'gram_off={row["gram_off_dense"]:.2f} xfer_off={row["transfer_off_dense"]:.2f}',
+              flush=True)
 
-    json.dump(dict(meta=dict(overwrite=OVERWRITE, n_features=P.NF,
+    json.dump(dict(meta=dict(overwrite=OVERWRITE, n_features=P.NF, projection=args.projection,
                              margin=L.MARGIN, tol=L.TOL), rows=rows),
               open(args.out, 'w'), indent=1)
     print('wrote', args.out)

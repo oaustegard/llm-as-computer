@@ -283,8 +283,19 @@ if __name__ == '__main__':
               f'indicator_norm={np.median(ind):.3f} dense_norm={np.median(dense):.3f}')
 
 
+def visited_states(data):
+    """Every feature-value vector the reference machine visits, as rows (N, NF)."""
+    q, win, neg, hix, scalars, gaps = data
+    rows = [np.asarray(q, dtype=float).reshape(-1, P.NF),
+            np.asarray(win, dtype=float).reshape(-1, P.NF),
+            np.asarray(neg, dtype=float).reshape(-1, P.NF)]
+    if len(scalars):
+        rows.append(np.stack([np.asarray(v, dtype=float) for v, _, _ in scalars]))
+    return np.unique(np.vstack(rows), axis=0)
+
+
 def train_continuation(d_min=4, d_max=None, data=None, iters=4000, verbose=True,
-                       tied=True):
+                       tied=True, projection='code'):
     """Compress one dimension at a time, starting from the exact solution.
 
     Training from a random init does not reach the optimum even where one provably
@@ -297,10 +308,17 @@ def train_continuation(d_min=4, d_max=None, data=None, iters=4000, verbose=True,
     singular subspace -- dropping the direction it is using least -- then retrain.
     Each step starts from a solved problem one dimension away.
 
+    ``projection`` picks what the SVD is taken over when a dimension is dropped:
+    'code' is the SVD of U itself (the rule used in RESULTS-A.md); 'data' is the SVD
+    of S @ U, the code's image of the visited states, which drops the direction the
+    trajectory uses least. The ALTA replication (experiments/alta-superposition)
+    found the two rules give different geometry on every program it tried.
+
     Returns {d: (U, diagnostics)}.
     """
     if data is None:
         data = harvest()
+    S = visited_states(data) if projection == 'data' else None
     d_max = d_max or P.NF
     out = {}
     U = np.eye(P.NF)[:, :d_max] if d_max <= P.NF else None
@@ -309,7 +327,8 @@ def train_continuation(d_min=4, d_max=None, data=None, iters=4000, verbose=True,
     for d in range(d_max, d_min - 1, -1):
         if d < U.shape[1]:
             # drop the least-used direction, keeping the code's own geometry
-            _, _, Vt = np.linalg.svd(U, full_matrices=False)
+            basis = U if S is None else S @ U
+            _, _, Vt = np.linalg.svd(basis, full_matrices=False)
             U = U @ Vt[:d].T
         (U, Rm), fin = train(d, 0, data=data, iters=iters, init=U, tied=tied)
         out[d] = (U.copy(), Rm.copy(), fin)

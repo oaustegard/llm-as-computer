@@ -170,3 +170,33 @@ OMP_NUM_THREADS=1 python3 eval_learned.py     # ~5 min
 OMP_NUM_THREADS=1 python3 probe_learned.py    # ~12 min, includes the held-out runs
 python3 plot_learned.py
 ```
+
+## Projection rule
+
+The ALTA replication (`oaustegard/experiments`, `alta-superposition/`, 2026-09-06)
+found that the rule used to drop a dimension inside the continuation decides whether
+survivors share directions: projecting onto the code's own top singular subspace, the
+rule above, gave orthogonal survivors and a cliff at the live count on every ALTA
+program, while projecting onto the code's image of the visited states let every
+program compress below live with shared directions. The LAC run was repeated with
+the second rule (`eval_learned.py --projection data`, output
+`learned_results_data.json`, same objective, same widths, same machine).
+
+| rule | smallest working `d` | Gram off-diagonal of the dense features at working widths | opcode indicators at `d` = 12 |
+|---|--:|--:|--:|
+| code SVD (August) | 12 | 0.00e+00 | exactly 0 |
+| trajectory SVD | 11 | 0.37 to 0.44 (transfer 0.27 to 0.30) | median norm 0.09, tapering from 0.93 at `d` = 21 |
+
+Under the trajectory rule the machine computes all four programs and the analyst
+recovers 12 of 12 at every width from 24 down to 11, with the twelve dense feature
+directions non-orthogonal from `d` = 21 downward. The claim above that the
+compression is deletion throughout and that the survivors stay exactly orthogonal is
+withdrawn: it described the projection rule, and a different rule produces a shared
+code that runs the same programs.
+
+What the rerun leaves standing is the amount. One dimension is gained, 12 to 11,
+where ALTA's SUBLEQ gained 26 of 121 and its parity programs 14 of 31 and 2 of 7.
+The LAC-specific candidate for that gap is unchanged: the machine holds integers up
+to 5050 and reads them against a tolerance of 0.5, so any shared direction costs
+absolute error that ALTA's bucketed values in [-16, 16] never pay. The rerun does not
+test that; it removes the other explanation.

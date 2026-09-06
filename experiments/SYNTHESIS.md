@@ -101,10 +101,13 @@ rule that projects onto the code's image of the visited states, all three
 compress below live with shared directions: SUBLEQ to 95 of 121 (interference
 0.47), sequential parity to 17 of 31 (0.46), feed-forward parity to 5 of 7
 (0.38). Looped and feed-forward programs behave alike in both arms, so
-iteration is not what forbade sharing. The LAC run has not yet been repeated
-with the second rule. The remaining candidate specific to LAC is its dynamic
-range, values to 5050 read against a tolerance of 0.5, which ALTA's SUBLEQ,
-holding values in [-16, 16] as one-hot buckets, does not test.
+iteration is not what forbade sharing. Repeated on LAC with the second rule,
+the fitted code runs all four programs down to `d` = 11 with the dense
+features in shared directions (Gram off-diagonal 0.37 to 0.44), so the
+orthogonality reported above was the projection rule's. The gain is one
+dimension, against 26 of 121 for SUBLEQ, and the candidate for that gap is
+LAC's dynamic range, values to 5050 read against a tolerance of 0.5, which
+ALTA's SUBLEQ, holding values in [-16, 16] as one-hot buckets, does not test.
 
 ## Continued training
 
@@ -165,7 +168,7 @@ inputs feed the operation.
 |---|---|---|---|
 | blind recovery (2026-08-11) | basis permuted, names stripped | all 12 opcodes, addressing, replay | 27 dead dimensions, all names |
 | random code (2026-08-12) | 24 features on random unit vectors | ISA recovery to `d` = 16384 | computation at every width |
-| learned code (2026-08-12) | code fit by gradient descent | computation and recovery to `d` = 12 | everything at `d` = 11 |
+| learned code (2026-08-12, rerun 2026-09-06) | code fit by gradient descent, two projection rules | computation and recovery to `d` = 12 (code SVD) or 11 (trajectory SVD, shared directions) | everything at `d` = 11 or 10 |
 | training monitor (2026-09-05) | AdamW from the compiled point | ISA readability to L2 ≈ 1.0; correctness under a preservation loss at lr ≤ 1e-5 | correctness below L2 0.1 at lr 1e-3 |
 | ALTA replication (2026-09-06) | same code fit on a second compiler, two projection rules | shared directions on every program under trajectory SVD (95/121, 17/31, 5/7) | the no-sharing claim as a property of iteration; it holds only under code SVD |
 
